@@ -7,6 +7,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include <TinyGPSPlus.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 // Serial monitor
 static const uint32_t USB_BAUD = 115200;
@@ -35,6 +37,159 @@ File gpxFile;
 static bool filesRenamedToTimestamp = false;
 File sessionFile;
 static uint32_t pointsLogged = 0;
+
+// ===== Live monitoring over Wi‑Fi (phone) =====
+#ifndef WIFI_SSID
+#define WIFI_SSID "Numericable-a82d-5g"   // set to your Wi‑Fi SSID to use STA mode
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS "l11m99y7zcxf"   // set to your Wi‑Fi password
+#endif
+
+static WebServer server(80);
+static bool wifiActive = false;
+static bool wifiIsAP = false;
+static IPAddress wifiIP;
+
+struct GpsLiveState {
+  bool hasFix = false;
+  double lat = NAN;
+  double lon = NAN;
+  double alt = NAN;
+  double spd = NAN;
+  double crs = NAN;
+  double hdop = NAN;
+  uint32_t sats = 0;
+  uint32_t lastUpdateMs = 0;
+  String ts; // ISO8601 timestamp or placeholder
+};
+static GpsLiveState gState;
+
+// Simple embedded page (offline-first, no external CDN dependencies)
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32 GPS Live</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 0; padding: 12px; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    #grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background:#eee; }
+    footer { color:#666; font-size: 12px; margin-top: 8px; }
+    a.btn { background:#0b5; color:white; text-decoration:none; padding:6px 10px; border-radius:6px; display:inline-block; }
+  </style>
+</head>
+<body>
+  <h1>ESP32 GPS Live <span id="fix" class="pill">—</span></h1>
+  <div id="grid">
+    <div>Time (UTC)</div><div id="ts" class="mono">—</div>
+    <div>Latitude</div><div id="lat" class="mono">—</div>
+    <div>Longitude</div><div id="lon" class="mono">—</div>
+    <div>Speed</div><div id="spd" class="mono">—</div>
+    <div>Course</div><div id="crs" class="mono">—</div>
+    <div>Satellites</div><div id="sats" class="mono">—</div>
+    <div>HDOP</div><div id="hdop" class="mono">—</div>
+    <div>Age</div><div id="age" class="mono">—</div>
+  </div>
+  <p><a id="gm" class="btn" href="#" target="_blank">Open in Google Maps</a></p>
+  <footer>Offline‑first: page loads even in ESP32 AP without Internet. Use the Google Maps link when you have Internet.</footer>
+  <script>
+  async function tick(){
+    try{
+      const r = await fetch('/gps.json',{cache:'no-store'});
+      const j = await r.json();
+      document.getElementById('ts').textContent = j.ts || '—';
+      document.getElementById('fix').textContent = j.hasFix? 'FIX' : 'NO FIX';
+      document.getElementById('fix').style.background = j.hasFix? '#0b5' : '#c33';
+      document.getElementById('sats').textContent = j.sats ?? '—';
+      document.getElementById('hdop').textContent = j.hdop ?? '—';
+      document.getElementById('age').textContent = (j.ageMs!=null? (j.ageMs+' ms') : '—');
+      const latEl = document.getElementById('lat');
+      const lonEl = document.getElementById('lon');
+      const spdEl = document.getElementById('spd');
+      const crsEl = document.getElementById('crs');
+      if(j.hasFix && j.lat!=null && j.lon!=null){
+        latEl.textContent = j.lat.toFixed(6);
+        lonEl.textContent = j.lon.toFixed(6);
+        spdEl.textContent = (j.speed!=null? (j.speed.toFixed(2)+' km/h') : '—');
+        crsEl.textContent = (j.course!=null? (j.course.toFixed(1)+'°') : '—');
+        document.getElementById('gm').href = `https://maps.google.com/?q=${j.lat},${j.lon}`;
+      } else {
+        latEl.textContent = lonEl.textContent = spdEl.textContent = crsEl.textContent = '—';
+      }
+    }catch(e){ /* ignore */ }
+  }
+  setInterval(tick, 1000);
+  tick();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static void startWiFiAndWeb() {
+  // Try Station mode if credentials provided
+  if (strlen(WIFI_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[WiFi] Connecting to '%s'...\n", WIFI_SSID);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiActive = true;
+      wifiIsAP = false;
+      wifiIP = WiFi.localIP();
+      Serial.printf("[WiFi] Connected. IP: %s\n", wifiIP.toString().c_str());
+    } else {
+      Serial.println("[WiFi] STA connect timeout, falling back to AP");
+    }
+  }
+
+  // Fallback to Access Point so phone can connect anywhere
+  if (!wifiActive) {
+    WiFi.mode(WIFI_AP);
+    String ssid = String("GPS-Tracker-") + String((uint32_t)ESP.getEfuseMac(), HEX).substring(4);
+    const char* pass = "gpslogger"; // simple default; change if desired
+    bool ok = WiFi.softAP(ssid.c_str(), pass);
+    wifiActive = ok;
+    wifiIsAP = true;
+    wifiIP = WiFi.softAPIP();
+    Serial.printf("[WiFi] AP %s (%s). IP: %s, pass: %s\n", ok?"started":"FAILED", ssid.c_str(), wifiIP.toString().c_str(), pass);
+  }
+
+  if (wifiActive) {
+    server.on("/", []() {
+      server.send_P(200, "text/html", INDEX_HTML);
+    });
+    server.on("/ping", []() { server.send(200, "text/plain", "pong"); });
+    server.on("/gps.json", []() {
+      String s; s.reserve(256);
+      s += F("{");
+      s += F("\"hasFix\":"); s += (gState.hasFix ? F("true") : F("false"));
+      s += F(",\"ts\":\""); s += gState.ts; s += F("\"");
+      s += F(",\"lat\":"); s += (gState.hasFix ? String(gState.lat, 6) : String(F("null")));
+      s += F(",\"lon\":"); s += (gState.hasFix ? String(gState.lon, 6) : String(F("null")));
+      s += F(",\"alt\":"); s += (!isnan(gState.alt) ? String(gState.alt, 1) : String(F("null")));
+      s += F(",\"speed\":"); s += (!isnan(gState.spd) ? String(gState.spd, 2) : String(F("null")));
+      s += F(",\"course\":"); s += (!isnan(gState.crs) ? String(gState.crs, 1) : String(F("null")));
+      s += F(",\"sats\":"); s += String(gState.sats);
+      s += F(",\"hdop\":"); s += (!isnan(gState.hdop) ? String(gState.hdop, 2) : String(F("null")));
+      s += F(",\"ageMs\":"); s += String((unsigned long)(millis() - gState.lastUpdateMs));
+      s += F("}");
+      server.send(200, "application/json", s);
+    });
+    server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+    server.begin();
+    Serial.printf("[HTTP] Web server on http://%s/\n", wifiIP.toString().c_str());
+    if (wifiIsAP) {
+      Serial.println("[HTTP] Note: Map tiles may not load without Internet; data still live");
+    }
+  }
+}
 
 // Forward declarations for functions used before definition
 static String isoTimestampUTC();
@@ -303,6 +458,9 @@ void setup() {
 
   startGPS();
   logBoth("[BOOT] Logger started. Interval=%lu ms\n", (unsigned long)LOG_INTERVAL_MS);
+
+  // Start Wi‑Fi + web server for phone live view
+  startWiFiAndWeb();
 }
 
 void loop() {
@@ -343,5 +501,27 @@ void loop() {
             (unsigned long)gps.sentencesWithFix(),
             (unsigned long)pointsLogged,
             (unsigned long)noFixReports);
+  }
+
+  // Update live state (for web UI)
+  gState.sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  gState.hdop = gps.hdop.isValid() ? (gps.hdop.value() / 100.0) : NAN;
+  if (gps.location.isValid() && gps.location.age() < 2000) {
+    gState.hasFix = true;
+    gState.lat = gps.location.lat();
+    gState.lon = gps.location.lng();
+    gState.alt = gps.altitude.isValid() ? gps.altitude.meters() : NAN;
+    gState.spd = gps.speed.isValid() ? gps.speed.kmph() : NAN;
+    gState.crs = gps.course.isValid() ? gps.course.deg() : NAN;
+    gState.ts = isoTimestampUTC();
+    gState.lastUpdateMs = now;
+  } else {
+    gState.hasFix = false;
+    gState.ts = isoTimestampUTC();
+  }
+
+  // Service HTTP requests
+  if (wifiActive) {
+    server.handleClient();
   }
 }
