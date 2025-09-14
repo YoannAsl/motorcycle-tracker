@@ -26,12 +26,15 @@ static const int SD_MOSI_PIN = 23;
 static const uint32_t LOG_INTERVAL_MS = 1000; // 1 Hz route logging
 static char csvPath[32];
 static char gpxPath[32];
+static char sessionPath[32];
 
 HardwareSerial GPS_Serial(1);
 TinyGPSPlus gps;
 File csvFile;
 File gpxFile;
 static bool filesRenamedToTimestamp = false;
+File sessionFile;
+static uint32_t pointsLogged = 0;
 
 // Forward declarations for functions used before definition
 static String isoTimestampUTC();
@@ -58,7 +61,8 @@ static bool nextLogNames() {
   for (int i = 1; i <= 9999; ++i) {
     snprintf(csvPath, sizeof(csvPath), "/gpslog-%04d.csv", i);
     snprintf(gpxPath, sizeof(gpxPath), "/gpslog-%04d.gpx", i);
-    if (!SD.exists(csvPath) && !SD.exists(gpxPath)) {
+    snprintf(sessionPath, sizeof(sessionPath), "/session-%04d.log", i);
+    if (!SD.exists(csvPath) && !SD.exists(gpxPath) && !SD.exists(sessionPath)) {
       return true;
     }
   }
@@ -115,6 +119,30 @@ static bool openGPX() {
   return true;
 }
 
+// Simple helper to mirror logs to Serial and session file
+#include <stdarg.h>
+static void logBoth(const char* fmt, ...) {
+  char buf[256];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.print(buf);
+  if (sessionFile) { sessionFile.print(buf); sessionFile.flush(); }
+}
+
+static bool openSession() {
+  sessionFile = SD.open(sessionPath, FILE_WRITE);
+  if (!sessionFile) {
+    Serial.println("[SD] Open session log FAILED");
+    return false;
+  }
+  logBoth("[BOOT] Session log -> %s\n", sessionPath);
+  logBoth("[BOOT] CSV path -> %s\n", csvPath);
+  logBoth("[BOOT] GPX path -> %s\n", gpxPath);
+  logBoth("[BOOT] GPS UART RX=%d TX=%d baud=%lu\n", GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
+  return true;
+}
+
 static void startGPS() {
   GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.printf("[GPS] UART on RX=%d TX=%d @ %lu baud\n", GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
@@ -153,38 +181,47 @@ static void maybeRenameLogsToTimestamp() {
 
   char newCsv[40];
   char newGpx[40];
+  char newSes[40];
   snprintf(newCsv, sizeof(newCsv), "/gpslog-%s.csv", base);
   snprintf(newGpx, sizeof(newGpx), "/gpslog-%s.gpx", base);
+  snprintf(newSes, sizeof(newSes), "/session-%s.log", base);
 
-  if (SD.exists(newCsv) || SD.exists(newGpx)) {
+  if (SD.exists(newCsv) || SD.exists(newGpx) || SD.exists(newSes)) {
     for (int i = 1; i <= 99; ++i) {
       snprintf(newCsv, sizeof(newCsv), "/gpslog-%s-%02d.csv", base, i);
       snprintf(newGpx, sizeof(newGpx), "/gpslog-%s-%02d.gpx", base, i);
-      if (!SD.exists(newCsv) && !SD.exists(newGpx)) break;
+      snprintf(newSes, sizeof(newSes), "/session-%s-%02d.log", base, i);
+      if (!SD.exists(newCsv) && !SD.exists(newGpx) && !SD.exists(newSes)) break;
       if (i == 99) return; // give up if too many collisions
     }
   }
 
   if (csvFile) csvFile.flush();
   if (gpxFile) gpxFile.flush();
+  if (sessionFile) sessionFile.flush();
   if (csvFile) csvFile.close();
   if (gpxFile) gpxFile.close();
+  if (sessionFile) sessionFile.close();
 
   bool okCsv = SD.rename(csvPath, newCsv);
   bool okGpx = SD.rename(gpxPath, newGpx);
+  bool okSes = SD.rename(sessionPath, newSes);
 
   if (okCsv) strncpy(csvPath, newCsv, sizeof(csvPath));
   if (okGpx) strncpy(gpxPath, newGpx, sizeof(gpxPath));
+  if (okSes) strncpy(sessionPath, newSes, sizeof(sessionPath));
 
   // Reopen for continued logging
   csvFile = SD.open(csvPath, FILE_APPEND);
   gpxFile = SD.open(gpxPath, FILE_WRITE);
+  sessionFile = SD.open(sessionPath, FILE_WRITE);
   if (!csvFile) Serial.println("[SD] Reopen CSV after rename FAILED");
   if (!gpxFile) Serial.println("[SD] Reopen GPX after rename FAILED");
+  if (!sessionFile) Serial.println("[SD] Reopen session after rename FAILED");
 
-  filesRenamedToTimestamp = okCsv && okGpx;
+  filesRenamedToTimestamp = okCsv && okGpx && okSes;
   if (filesRenamedToTimestamp) {
-    Serial.printf("[SD] Renamed to timestamp: %s | %s\n", csvPath, gpxPath);
+    Serial.printf("[SD] Renamed to timestamp: %s | %s | %s\n", csvPath, gpxPath, sessionPath);
   }
 }
 
@@ -207,6 +244,12 @@ static void logFixCSV() {
 
   Serial.printf("[LOG] %s lat=%.6f lon=%.6f spd=%.1fkm/h sats=%lu\n",
                 ts.c_str(), lat, lon, spd, (unsigned long)sats);
+  if (sessionFile) {
+    sessionFile.printf("[POINT] %s lat=%.6f lon=%.6f spd=%.1f hdop=%.2f sats=%lu\n",
+                       ts.c_str(), lat, lon, spd, hdop, (unsigned long)sats);
+    sessionFile.flush();
+  }
+  pointsLogged++;
 }
 
 static void logFixGPX() {
@@ -252,11 +295,14 @@ void setup() {
   if (!nextLogNames()) {
     Serial.println("Fatal: could not allocate log filenames");
   } else {
-    if (!openCSV()) Serial.println("Fatal: could not open CSV file");
-    if (!openGPX()) Serial.println("Fatal: could not open GPX file");
+    // Open session first so we can capture subsequent events
+    if (!openSession()) Serial.println("Fatal: could not open session log");
+    if (!openCSV()) logBoth("Fatal: could not open CSV file\n");
+    if (!openGPX()) logBoth("Fatal: could not open GPX file\n");
   }
 
   startGPS();
+  logBoth("[BOOT] Logger started. Interval=%lu ms\n", (unsigned long)LOG_INTERVAL_MS);
 }
 
 void loop() {
@@ -266,6 +312,8 @@ void loop() {
   }
 
   static uint32_t lastLog = 0;
+  static uint32_t lastHeartbeat = 0;
+  static uint32_t noFixReports = 0;
   uint32_t now = millis();
 
   // Log once per interval if we have a valid location fix
@@ -278,6 +326,22 @@ void loop() {
       logFixGPX();
     } else {
       Serial.println("[GPS] No valid fix yet...");
+      noFixReports++;
     }
+  }
+
+  // Heartbeat to session log every 60s for post-ride diagnostics
+  if (now - lastHeartbeat >= 60000) { // 60,000 ms = 60s
+    lastHeartbeat = now;
+    uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    double hdop = gps.hdop.isValid() ? (gps.hdop.value() / 100.0) : NAN;
+    logBoth("[HB] t=%.1fs sats=%lu hdop=%.2f chars=%lu fixSent=%lu points=%lu nofix=%lu\n",
+            now / 1000.0,
+            (unsigned long)sats,
+            hdop,
+            (unsigned long)gps.charsProcessed(),
+            (unsigned long)gps.sentencesWithFix(),
+            (unsigned long)pointsLogged,
+            (unsigned long)noFixReports);
   }
 }
