@@ -39,6 +39,9 @@ File sessionFile;
 static uint32_t pointsLogged = 0;
 
 // ===== Live monitoring over Wi‑Fi (phone) =====
+#ifndef LIVE_USE_BLE
+#define LIVE_USE_BLE 1  // set to 1 to use BLE instead of Wi‑Fi
+#endif
 #ifndef WIFI_SSID
 #define WIFI_SSID "Numericable-a82d-5g"   // set to your Wi‑Fi SSID to use STA mode
 #endif
@@ -190,6 +193,73 @@ static void startWiFiAndWeb() {
     }
   }
 }
+
+#if LIVE_USE_BLE
+#include <NimBLEDevice.h>
+
+// BLE Nordic UART UUIDs
+static const char* NUS_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char* NUS_RX_UUID      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"; // phone->ESP32 (unused)
+static const char* NUS_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"; // ESP32->phone notifications
+
+static NimBLECharacteristic* bleTxChar = nullptr;
+static bool bleClientConnected = false;
+
+class GpsBleServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* s) override { bleClientConnected = true; Serial.println("[BLE] Central connected"); }
+  void onDisconnect(NimBLEServer* s) override {
+    bleClientConnected = false; Serial.println("[BLE] Central disconnected; advertising");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+static String buildGpsJson() {
+  String s; s.reserve(256);
+  s += F("{");
+  s += F("\"hasFix\":"); s += (gState.hasFix ? F("true") : F("false"));
+  s += F(",\"ts\":\""); s += gState.ts; s += F("\"");
+  s += F(",\"lat\":"); s += (gState.hasFix ? String(gState.lat, 6) : String(F("null")));
+  s += F(",\"lon\":"); s += (gState.hasFix ? String(gState.lon, 6) : String(F("null")));
+  s += F(",\"alt\":"); s += (!isnan(gState.alt) ? String(gState.alt, 1) : String(F("null")));
+  s += F(",\"speed\":"); s += (!isnan(gState.spd) ? String(gState.spd, 2) : String(F("null")));
+  s += F(",\"course\":"); s += (!isnan(gState.crs) ? String(gState.crs, 1) : String(F("null")));
+  s += F(",\"sats\":"); s += String(gState.sats);
+  s += F(",\"hdop\":"); s += (!isnan(gState.hdop) ? String(gState.hdop, 2) : String(F("null")));
+  s += F(",\"ageMs\":"); s += String((unsigned long)(millis() - gState.lastUpdateMs));
+  s += F("}\n");
+  return s;
+}
+
+static void startBLE() {
+  String name = String("GPS-Tracker-") + String((uint32_t)ESP.getEfuseMac(), HEX).substring(4);
+  NimBLEDevice::init(name.c_str());
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9); // max tx for reliability; lower for lower power
+
+  NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new GpsBleServerCallbacks());
+
+  NimBLEService* service = server->createService(NUS_SERVICE_UUID);
+  bleTxChar = service->createCharacteristic(NUS_TX_UUID, NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
+  (void)service->createCharacteristic(NUS_RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  service->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(service->getUUID());
+  adv->setScanResponse(true);
+  adv->start();
+  Serial.printf("[BLE] Nordic UART advertising as %s\n", name.c_str());
+}
+
+static void bleNotifyIfReady(uint32_t now) {
+  static uint32_t last = 0;
+  if (!bleTxChar || !bleClientConnected) return;
+  if (now - last < 1000) return; // ~1 Hz
+  last = now;
+  String msg = buildGpsJson();
+  bleTxChar->setValue((uint8_t*)msg.c_str(), msg.length());
+  bleTxChar->notify();
+}
+#endif // LIVE_USE_BLE
 
 // Forward declarations for functions used before definition
 static String isoTimestampUTC();
@@ -459,8 +529,13 @@ void setup() {
   startGPS();
   logBoth("[BOOT] Logger started. Interval=%lu ms\n", (unsigned long)LOG_INTERVAL_MS);
 
-  // Start Wi‑Fi + web server for phone live view
+  // Start live transport
+#if LIVE_USE_BLE
+  startBLE();
+#else
+  // Wi‑Fi + web server for phone live view
   startWiFiAndWeb();
+#endif
 }
 
 void loop() {
@@ -524,4 +599,8 @@ void loop() {
   if (wifiActive) {
     server.handleClient();
   }
+
+#if LIVE_USE_BLE
+  bleNotifyIfReady(now);
+#endif
 }
