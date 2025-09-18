@@ -42,13 +42,12 @@ These notes summarize the setup, wiring, code behavior, and troubleshooting outc
 
 ## Current Behavior (Dual Logger)
 
-- Creates three files at boot using the first free index:
-  - CSV: `/gpslog-0001.csv`
-  - GPX: `/gpslog-0001.gpx`
-  - Session diagnostics: `/session-0001.log`
+- Creates a session folder at SD root using the first free index:
+  - Folder: `/session-0001/`
+  - Files inside: `gpslog.csv`, `gpslog.gpx`, `session.log`
 
-- Renames all three to timestamped names once GPS time is valid:
-  - Example: `gpslog-20250101_123045.csv/.gpx` and `session-20250101_123045.log`
+- Renames the session folder to a timestamp once GPS time is valid:
+  - Example: `/session-20250101_123045/`
 
 - Logs once per second when a valid fix is present:
   - CSV columns: `timestamp,lat,lon,alt_m,speed_kmh,course_deg,hdop,sats`
@@ -64,7 +63,7 @@ These notes summarize the setup, wiring, code behavior, and troubleshooting outc
 
 - Build/upload: `pio run -t upload`
 - Serial monitor: `pio device monitor` (115200). Press EN/Reset to re‑see boot logs.
-- Files saved to SD root. If GPS time never locks, files keep `-000X` names.
+- Files saved under the per‑session folder at SD root. If GPS time never locks, the folder keeps `session-000X`.
 
 ## Known Constraints & Tips
 
@@ -83,7 +82,7 @@ These notes summarize the setup, wiring, code behavior, and troubleshooting outc
 ## Troubleshooting
 
 - No logs created:
-  - Check SD root for `session-####.log` or timestamped `session-*.log`.
+  - Check SD root for `/session-####/session.log` or a timestamped folder.
   - If session log is missing → SD didn’t mount or board reset too early (power).
   - If session log exists with `[HB]` but no `[POINT]` → GPS never had a valid fix (antenna/sky view/filters).
 
@@ -117,4 +116,3 @@ These notes summarize the setup, wiring, code behavior, and troubleshooting outc
 ---
 
 If you change pins, file naming, or add filters, update this document accordingly for future reference.
-

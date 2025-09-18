@@ -24,9 +24,12 @@ static const int SD_MOSI_PIN = 23;
 
 // Log rate and filenames
 static const uint32_t LOG_INTERVAL_MS = 1000; // 1 Hz route logging
-static char csvPath[32];
-static char gpxPath[32];
-static char sessionPath[32];
+
+// Per-session directory at SD root
+static char sessionDir[64];      // e.g., "/session-0001" then "/session-YYYYMMDD_HHMMSS"
+static char csvPath[96];         // <sessionDir>/gpslog.csv
+static char gpxPath[96];         // <sessionDir>/gpslog.gpx
+static char sessionPath[96];     // <sessionDir>/session.log
 
 HardwareSerial GPS_Serial(1);
 TinyGPSPlus gps;
@@ -57,12 +60,19 @@ static bool initSD() {
 }
 
 static bool nextLogNames() {
-  // Find the first free index: gpslog-0001.csv / .gpx
+  // Create a fresh session directory at SD root using the first free index
   for (int i = 1; i <= 9999; ++i) {
-    snprintf(csvPath, sizeof(csvPath), "/gpslog-%04d.csv", i);
-    snprintf(gpxPath, sizeof(gpxPath), "/gpslog-%04d.gpx", i);
-    snprintf(sessionPath, sizeof(sessionPath), "/session-%04d.log", i);
-    if (!SD.exists(csvPath) && !SD.exists(gpxPath) && !SD.exists(sessionPath)) {
+    snprintf(sessionDir, sizeof(sessionDir), "/session-%04d", i);
+    if (!SD.exists(sessionDir)) {
+      if (!SD.mkdir(sessionDir)) {
+        Serial.printf("[SD] mkdir %s FAILED\n", sessionDir);
+        return false;
+      }
+      // Place files inside the session directory with fixed names
+      snprintf(csvPath, sizeof(csvPath), "%s/gpslog.csv", sessionDir);
+      snprintf(gpxPath, sizeof(gpxPath), "%s/gpslog.gpx", sessionDir);
+      snprintf(sessionPath, sizeof(sessionPath), "%s/session.log", sessionDir);
+      Serial.printf("[SD] Session dir -> %s\n", sessionDir);
       return true;
     }
   }
@@ -179,49 +189,44 @@ static void maybeRenameLogsToTimestamp() {
   char base[24];
   if (!buildTimestampBase(base, sizeof(base))) return; // wait until time available
 
-  char newCsv[40];
-  char newGpx[40];
-  char newSes[40];
-  snprintf(newCsv, sizeof(newCsv), "/gpslog-%s.csv", base);
-  snprintf(newGpx, sizeof(newGpx), "/gpslog-%s.gpx", base);
-  snprintf(newSes, sizeof(newSes), "/session-%s.log", base);
-
-  if (SD.exists(newCsv) || SD.exists(newGpx) || SD.exists(newSes)) {
+  // Build target directory name at SD root: /session-YYYYMMDD_HHMMSS (avoid collisions with -NN suffix)
+  char newDir[64];
+  snprintf(newDir, sizeof(newDir), "/session-%s", base);
+  if (SD.exists(newDir)) {
     for (int i = 1; i <= 99; ++i) {
-      snprintf(newCsv, sizeof(newCsv), "/gpslog-%s-%02d.csv", base, i);
-      snprintf(newGpx, sizeof(newGpx), "/gpslog-%s-%02d.gpx", base, i);
-      snprintf(newSes, sizeof(newSes), "/session-%s-%02d.log", base, i);
-      if (!SD.exists(newCsv) && !SD.exists(newGpx) && !SD.exists(newSes)) break;
-      if (i == 99) return; // give up if too many collisions
+      snprintf(newDir, sizeof(newDir), "/session-%s-%02d", base, i);
+      if (!SD.exists(newDir)) break;
+      if (i == 99) return; // too many collisions
     }
   }
 
-  if (csvFile) csvFile.flush();
-  if (gpxFile) gpxFile.flush();
-  if (sessionFile) sessionFile.flush();
-  if (csvFile) csvFile.close();
-  if (gpxFile) gpxFile.close();
-  if (sessionFile) sessionFile.close();
+  // Close files before renaming the directory
+  if (csvFile) { csvFile.flush(); csvFile.close(); }
+  if (gpxFile) { gpxFile.flush(); gpxFile.close(); }
+  if (sessionFile) { sessionFile.flush(); sessionFile.close(); }
 
-  bool okCsv = SD.rename(csvPath, newCsv);
-  bool okGpx = SD.rename(gpxPath, newGpx);
-  bool okSes = SD.rename(sessionPath, newSes);
+  bool okDir = SD.rename(sessionDir, newDir);
+  if (!okDir) {
+    Serial.printf("[SD] Rename dir %s -> %s FAILED\n", sessionDir, newDir);
+    return;
+  }
 
-  if (okCsv) strncpy(csvPath, newCsv, sizeof(csvPath));
-  if (okGpx) strncpy(gpxPath, newGpx, sizeof(gpxPath));
-  if (okSes) strncpy(sessionPath, newSes, sizeof(sessionPath));
+  // Update paths to new directory and reopen
+  strncpy(sessionDir, newDir, sizeof(sessionDir));
+  snprintf(csvPath, sizeof(csvPath), "%s/gpslog.csv", sessionDir);
+  snprintf(gpxPath, sizeof(gpxPath), "%s/gpslog.gpx", sessionDir);
+  snprintf(sessionPath, sizeof(sessionPath), "%s/session.log", sessionDir);
 
-  // Reopen for continued logging
   csvFile = SD.open(csvPath, FILE_APPEND);
   gpxFile = SD.open(gpxPath, FILE_WRITE);
   sessionFile = SD.open(sessionPath, FILE_WRITE);
-  if (!csvFile) Serial.println("[SD] Reopen CSV after rename FAILED");
-  if (!gpxFile) Serial.println("[SD] Reopen GPX after rename FAILED");
-  if (!sessionFile) Serial.println("[SD] Reopen session after rename FAILED");
+  if (!csvFile) Serial.println("[SD] Reopen CSV after dir rename FAILED");
+  if (!gpxFile) Serial.println("[SD] Reopen GPX after dir rename FAILED");
+  if (!sessionFile) Serial.println("[SD] Reopen session after dir rename FAILED");
 
-  filesRenamedToTimestamp = okCsv && okGpx && okSes;
+  filesRenamedToTimestamp = (bool)okDir;
   if (filesRenamedToTimestamp) {
-    Serial.printf("[SD] Renamed to timestamp: %s | %s | %s\n", csvPath, gpxPath, sessionPath);
+    Serial.printf("[SD] Session folder timestamped: %s\n", sessionDir);
   }
 }
 
