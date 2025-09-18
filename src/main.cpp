@@ -24,6 +24,7 @@ static const int SD_MOSI_PIN = 23;
 
 // Log rate and filenames
 static const uint32_t LOG_INTERVAL_MS = 1000; // 1 Hz route logging
+static const double MIN_LOG_SPEED_KMH = 2.0;  // Skip points below ~2 km/h (stationary)
 
 // Per-session directory at SD root
 static char sessionDir[64];      // e.g., "/session-0001" then "/session-YYYYMMDD_HHMMSS"
@@ -327,8 +328,19 @@ void loop() {
     // Rename files to timestamped names once GPS time is valid
     maybeRenameLogsToTimestamp();
     if (gps.location.isValid() && gps.location.age() < 2000) {
-      logFixCSV();
-      logFixGPX();
+      bool speedValid = gps.speed.isValid();
+      double currentSpeed = speedValid ? gps.speed.kmph() : NAN;
+      if (speedValid && currentSpeed > MIN_LOG_SPEED_KMH) {
+        logFixCSV();
+        logFixGPX();
+      } else {
+        if (speedValid) {
+          logBoth("[SKIP] speed=%.1fkm/h below %.1fkm/h threshold\n",
+                  currentSpeed, MIN_LOG_SPEED_KMH);
+        } else {
+          logBoth("[SKIP] speed invalid, not logging point\n");
+        }
+      }
     } else {
       Serial.println("[GPS] No valid fix yet...");
       noFixReports++;
