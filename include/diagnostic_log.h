@@ -30,6 +30,12 @@ struct DiagnosticLogUpload {
   std::string contents;
 };
 
+struct StoredDiagnosticLog {
+  uint32_t trackingSessionNumber = 0;
+  std::string contents;
+  std::string deliveryState;
+};
+
 struct DiagnosticUploadRequest {
   std::string url;
   struct Header {
@@ -57,5 +63,11 @@ bool validateDiagnosticUploadResponse(int statusCode,
                                       const std::string& responseBody,
                                       const DiagnosticLogUpload& upload);
 std::string diagnosticUploadFailureMessage(DiagnosticUploadFailure failure);
+std::string serializeDiagnosticDelivery(const std::string& trackerId,
+                                        uint32_t trackingSessionNumber);
+bool selectOldestPendingDiagnosticLog(
+    const std::string& trackerId,
+    const std::vector<StoredDiagnosticLog>& storedLogs,
+    DiagnosticLogUpload& pending);
 
 }  // namespace tracking

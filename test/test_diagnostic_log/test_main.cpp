@@ -79,6 +79,10 @@ void only_a_valid_matching_confirmation_marks_the_log_delivered() {
   TEST_ASSERT_FALSE(tracking::validateDiagnosticUploadResponse(
       200, "malformed", upload));
   TEST_ASSERT_FALSE(tracking::validateDiagnosticUploadResponse(
+      200,
+      "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":41,"
+      "\"diagnostic_log_stored\":true,}", upload));
+  TEST_ASSERT_FALSE(tracking::validateDiagnosticUploadResponse(
       401,
       "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":41,"
       "\"diagnostic_log_stored\":true}", upload));
@@ -111,6 +115,40 @@ void failure_messages_distinguish_actionable_causes() {
                             .find("timeout"));
 }
 
+void completed_logs_stay_pending_until_matching_confirmation_is_persisted() {
+  tracking::StoredDiagnosticLog older;
+  older.trackingSessionNumber = 41;
+  older.contents = "[BOOT] reset=power-on\n";
+  tracking::StoredDiagnosticLog newer;
+  newer.trackingSessionNumber = 42;
+  newer.contents = "[BOOT] reset=watchdog\n";
+  std::vector<tracking::StoredDiagnosticLog> stored = {newer, older};
+  tracking::DiagnosticLogUpload pending;
+
+  TEST_ASSERT_TRUE(tracking::selectOldestPendingDiagnosticLog(
+      "tracker-01", stored, pending));
+  TEST_ASSERT_EQUAL_UINT32(41, pending.trackingSessionNumber);
+
+  TEST_ASSERT_FALSE(tracking::validateDiagnosticUploadResponse(
+      200,
+      "{\"tracker_id\":\"other\",\"tracking_session_number\":41,"
+      "\"diagnostic_log_stored\":true}", pending));
+  TEST_ASSERT_TRUE(stored[1].deliveryState.empty());
+  TEST_ASSERT_TRUE(tracking::selectOldestPendingDiagnosticLog(
+      "tracker-01", stored, pending));
+
+  stored[1].deliveryState =
+      tracking::serializeDiagnosticDelivery("tracker-01", 41);
+  TEST_ASSERT_TRUE(tracking::selectOldestPendingDiagnosticLog(
+      "tracker-01", stored, pending));
+  TEST_ASSERT_EQUAL_UINT32(42, pending.trackingSessionNumber);
+
+  stored[0].deliveryState =
+      tracking::serializeDiagnosticDelivery("tracker-01", 42);
+  TEST_ASSERT_FALSE(tracking::selectOldestPendingDiagnosticLog(
+      "tracker-01", stored, pending));
+}
+
 }  // namespace
 
 int main(int, char**) {
@@ -119,5 +157,6 @@ int main(int, char**) {
   RUN_TEST(completed_log_request_has_stable_identity_and_is_retry_safe);
   RUN_TEST(only_a_valid_matching_confirmation_marks_the_log_delivered);
   RUN_TEST(failure_messages_distinguish_actionable_causes);
+  RUN_TEST(completed_logs_stay_pending_until_matching_confirmation_is_persisted);
   return UNITY_END();
 }
