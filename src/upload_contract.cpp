@@ -49,13 +49,17 @@ bool parseString(const std::string& input, size_t& position,
 
 bool parseUInt(const std::string& input, size_t& position, uint32_t& value) {
   skipWhitespace(input, position);
-  if (position >= input.size() || !std::isdigit(input[position])) return false;
+  if (position >= input.size() ||
+      !std::isdigit(static_cast<unsigned char>(input[position]))) {
+    return false;
+  }
   uint64_t parsed = 0;
   do {
     parsed = parsed * 10 + static_cast<unsigned>(input[position] - '0');
     if (parsed > std::numeric_limits<uint32_t>::max()) return false;
     ++position;
-  } while (position < input.size() && std::isdigit(input[position]));
+  } while (position < input.size() &&
+           std::isdigit(static_cast<unsigned char>(input[position])));
   value = static_cast<uint32_t>(parsed);
   return true;
 }
@@ -66,16 +70,58 @@ bool skipSimpleValue(const std::string& input, size_t& position) {
   if (position < input.size() && input[position] == '"') {
     return parseString(input, position, ignored);
   }
-  const size_t start = position;
-  while (position < input.size() && input[position] != ',' &&
-         input[position] != '}') {
-    ++position;
+  const char* literals[] = {"true", "false", "null"};
+  for (size_t index = 0; index < 3; ++index) {
+    const std::string literal(literals[index]);
+    if (input.compare(position, literal.size(), literal) == 0) {
+      position += literal.size();
+      return true;
+    }
   }
-  size_t end = position;
-  while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-    --end;
+
+  size_t cursor = position;
+  if (cursor < input.size() && input[cursor] == '-') ++cursor;
+  if (cursor >= input.size() ||
+      !std::isdigit(static_cast<unsigned char>(input[cursor]))) {
+    return false;
   }
-  return end > start;
+  if (input[cursor] == '0') {
+    ++cursor;
+  } else {
+    while (cursor < input.size() &&
+           std::isdigit(static_cast<unsigned char>(input[cursor]))) {
+      ++cursor;
+    }
+  }
+  if (cursor < input.size() && input[cursor] == '.') {
+    ++cursor;
+    if (cursor >= input.size() ||
+        !std::isdigit(static_cast<unsigned char>(input[cursor]))) {
+      return false;
+    }
+    while (cursor < input.size() &&
+           std::isdigit(static_cast<unsigned char>(input[cursor]))) {
+      ++cursor;
+    }
+  }
+  if (cursor < input.size() &&
+      (input[cursor] == 'e' || input[cursor] == 'E')) {
+    ++cursor;
+    if (cursor < input.size() &&
+        (input[cursor] == '+' || input[cursor] == '-')) {
+      ++cursor;
+    }
+    if (cursor >= input.size() ||
+        !std::isdigit(static_cast<unsigned char>(input[cursor]))) {
+      return false;
+    }
+    while (cursor < input.size() &&
+           std::isdigit(static_cast<unsigned char>(input[cursor]))) {
+      ++cursor;
+    }
+  }
+  position = cursor;
+  return true;
 }
 
 bool parseConfirmation(const std::string& input, std::string& trackerId,
@@ -120,6 +166,9 @@ bool parseConfirmation(const std::string& input, std::string& trackerId,
     skipWhitespace(input, position);
     if (position < input.size() && input[position] == ',') {
       ++position;
+      size_t next = position;
+      skipWhitespace(input, next);
+      if (next >= input.size() || input[next] == '}') return false;
       continue;
     }
     if (position < input.size() && input[position] == '}') {
@@ -202,13 +251,17 @@ bool buildUploadRequest(const std::string& uploadUrl,
   const uint32_t lastPoint = batch.firstPointNumber +
                              static_cast<uint32_t>(batch.ndjsonPoints.size()) - 1;
   request.url = uploadUrl;
-  request.authorization = "Bearer " + bearerToken;
-  request.contentType = "application/x-ndjson";
-  request.schemaVersion = number(batch.schemaVersion);
-  request.trackerId = batch.trackerId;
-  request.trackingSessionNumber = number(batch.trackingSessionNumber);
-  request.firstPointNumber = number(batch.firstPointNumber);
-  request.lastPointNumber = number(lastPoint);
+  request.headers.clear();
+  request.headers.push_back({"Authorization", "Bearer " + bearerToken});
+  request.headers.push_back({"Content-Type", "application/x-ndjson"});
+  request.headers.push_back(
+      {"X-Track-Point-Schema-Version", number(batch.schemaVersion)});
+  request.headers.push_back({"X-Tracker-ID", batch.trackerId});
+  request.headers.push_back(
+      {"X-Tracking-Session-Number", number(batch.trackingSessionNumber)});
+  request.headers.push_back(
+      {"X-First-Point-Number", number(batch.firstPointNumber)});
+  request.headers.push_back({"X-Last-Point-Number", number(lastPoint)});
   request.body = body;
   return true;
 }

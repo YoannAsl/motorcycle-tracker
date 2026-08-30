@@ -16,13 +16,11 @@ struct UploadBatch {
 
 struct UploadRequest {
   std::string url;
-  std::string authorization;
-  std::string contentType;
-  std::string schemaVersion;
-  std::string trackerId;
-  std::string trackingSessionNumber;
-  std::string firstPointNumber;
-  std::string lastPointNumber;
+  struct Header {
+    std::string name;
+    std::string value;
+  };
+  std::vector<Header> headers;
   std::string body;
 };
 

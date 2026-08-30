@@ -25,13 +25,34 @@ Many large cards ship as exFAT. Reformat the card as FAT32 with an MBR partition
 
 ## Tracker configuration
 
-Copy `include/tracker_config.example.h` to `include/tracker_config.h`. Replace the placeholder with one stable identifier for the physical tracker:
+Copy `include/tracker_config.example.h` to `include/tracker_config.h`. Set the phone hotspot, upload service, tracker identity, bearer token, and root CA:
 
 ```cpp
+#define HOTSPOT_NAME "my-phone-hotspot"
+#define HOTSPOT_PASSWORD "replace-with-hotspot-password"
+#define UPLOAD_URL "https://uploads.example/v1/track-point-batches"
 #define TRACKER_ID "motorcycle-tracker-01"
+#define TRACKER_TOKEN "replace-with-bearer-token"
+#define UPLOAD_ROOT_CA_CERTIFICATE "-----BEGIN CERTIFICATE-----\n...\n"
 ```
 
-Git ignores `include/tracker_config.h`. If it is missing, the firmware still builds with the placeholder from the example file. Do not use that placeholder for real data.
+Git ignores `include/tracker_config.h`. If it is missing, the firmware still builds with the placeholders from the example file. Do not use those placeholders on a tracker.
+
+The ESP32 connects only as a Wi-Fi station. It does not start an access point, configuration page, captive portal, or dashboard.
+
+## Track point delivery
+
+One background task waits for 30 pending points from one tracking session. It copies those ordered NDJSON lines into memory and closes the SD file before it starts the HTTPS request. DNS, connection, TLS, and response delays therefore run outside the GPS loop. SD operations use a shared mutex, and the upload task runs below the recording task's priority.
+
+The task posts to the configured `/v1/track-point-batches` path with `application/x-ndjson`, bearer authentication, and these metadata headers:
+
+- `X-Track-Point-Schema-Version`
+- `X-Tracker-ID`
+- `X-Tracking-Session-Number`
+- `X-First-Point-Number`
+- `X-Last-Point-Number`
+
+TLS uses the configured root CA. There is no insecure mode. The tracker advances local delivery progress only for a 2xx JSON response whose tracker and tracking session identities match and whose `highest_stored_point_number` covers the sent range. Network errors, non-2xx responses, malformed responses, identity mismatches, and incomplete confirmations leave the points pending. A repeated request is safe because stable identities and point numbers describe the same range.
 
 ## When recording starts
 
