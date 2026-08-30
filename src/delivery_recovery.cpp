@@ -73,6 +73,8 @@ std::vector<RecoveredTrackingSession> recoverTrackingSessions(
     RecoveredTrackingSession session;
     session.trackingSessionNumber = stored->trackingSessionNumber;
     session.highestRecordedPoint = stored->highestRecordedPoint;
+    session.recoveryRequired =
+        stored->highestRecordedPoint > 0 && stored->deliveryState.empty();
 
     std::istringstream records(stored->deliveryState);
     std::string line;
