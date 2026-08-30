@@ -33,6 +33,15 @@ tracking::UploadBatch thirtyPoints() {
   return batch;
 }
 
+const char* header(const tracking::UploadRequest& request, const char* name) {
+  for (std::vector<tracking::UploadRequest::Header>::const_iterator it =
+           request.headers.begin();
+       it != request.headers.end(); ++it) {
+    if (it->name == name) return it->value.c_str();
+  }
+  return nullptr;
+}
+
 void request_carries_authentication_content_type_identity_and_range() {
   tracking::UploadRequest request;
   const tracking::UploadBatch batch = thirtyPoints();
@@ -44,13 +53,17 @@ void request_carries_authentication_content_type_identity_and_range() {
   TEST_ASSERT_TRUE(built);
   TEST_ASSERT_EQUAL_STRING(
       "https://uploads.example/v1/track-point-batches", request.url.c_str());
-  TEST_ASSERT_EQUAL_STRING("Bearer secret-token", request.authorization.c_str());
-  TEST_ASSERT_EQUAL_STRING("application/x-ndjson", request.contentType.c_str());
-  TEST_ASSERT_EQUAL_STRING("1", request.schemaVersion.c_str());
-  TEST_ASSERT_EQUAL_STRING("tracker-01", request.trackerId.c_str());
-  TEST_ASSERT_EQUAL_STRING("41", request.trackingSessionNumber.c_str());
-  TEST_ASSERT_EQUAL_STRING("1", request.firstPointNumber.c_str());
-  TEST_ASSERT_EQUAL_STRING("30", request.lastPointNumber.c_str());
+  TEST_ASSERT_EQUAL_STRING("Bearer secret-token",
+                           header(request, "Authorization"));
+  TEST_ASSERT_EQUAL_STRING("application/x-ndjson",
+                           header(request, "Content-Type"));
+  TEST_ASSERT_EQUAL_STRING("1",
+                           header(request, "X-Track-Point-Schema-Version"));
+  TEST_ASSERT_EQUAL_STRING("tracker-01", header(request, "X-Tracker-ID"));
+  TEST_ASSERT_EQUAL_STRING("41",
+                           header(request, "X-Tracking-Session-Number"));
+  TEST_ASSERT_EQUAL_STRING("1", header(request, "X-First-Point-Number"));
+  TEST_ASSERT_EQUAL_STRING("30", header(request, "X-Last-Point-Number"));
   TEST_ASSERT_EQUAL_STRING((point(1) + "\n").c_str(),
                            request.body.substr(0, point(1).size() + 1).c_str());
   TEST_ASSERT_EQUAL_CHAR('\n', request.body[request.body.size() - 1]);
@@ -95,6 +108,16 @@ void only_matching_complete_success_confirms_delivery() {
       batch, confirmation));
   TEST_ASSERT_FALSE(tracking::validateUploadResponse(200, "not-json", batch,
                                                      confirmation));
+  TEST_ASSERT_FALSE(tracking::validateUploadResponse(
+      200,
+      "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":41,"
+      "\"highest_stored_point_number\":30,}",
+      batch, confirmation));
+  TEST_ASSERT_FALSE(tracking::validateUploadResponse(
+      200,
+      "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":41,"
+      "\"highest_stored_point_number\":30,\"extra\":not-json}",
+      batch, confirmation));
   TEST_ASSERT_FALSE(tracking::validateUploadResponse(
       200,
       "{\"tracker_id\":\"other\",\"tracking_session_number\":41,"

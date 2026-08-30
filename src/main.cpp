@@ -2,13 +2,18 @@
 // GPS: TX->GPIO16, RX->GPIO17. SD SPI: CS 5, SCK 18, MISO 19, MOSI 23.
 
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <TinyGPSPlus.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <freertos/semphr.h>
 
 #include "delivery_recovery.h"
 #include "tracking_workflow.h"
+#include "upload_contract.h"
 
 #if __has_include("tracker_config.h")
 #include "tracker_config.h"
@@ -27,6 +32,7 @@ const int SD_SCK_PIN = 18;
 const int SD_MISO_PIN = 19;
 const int SD_MOSI_PIN = 23;
 const uint32_t LOG_INTERVAL_MS = 1000;
+const uint32_t NETWORK_TIMEOUT_MS = 15000;
 
 const char GPX_HEADER[] =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -45,6 +51,21 @@ File rawPointFile;
 char trackingSessionDirectory[48];
 uint32_t rawPointsRecorded = 0;
 uint32_t noFreshLocationCount = 0;
+SemaphoreHandle_t sdMutex = nullptr;
+
+class ScopedSdLock {
+ public:
+  ScopedSdLock()
+      : locked_(sdMutex != nullptr &&
+                xSemaphoreTakeRecursive(sdMutex, portMAX_DELAY) == pdTRUE) {}
+  ~ScopedSdLock() {
+    if (locked_) xSemaphoreGiveRecursive(sdMutex);
+  }
+  explicit operator bool() const { return locked_; }
+
+ private:
+  bool locked_;
+};
 
 void logDiagnostic(const char* format, ...) {
   char buffer[256];
@@ -53,6 +74,7 @@ void logDiagnostic(const char* format, ...) {
   vsnprintf(buffer, sizeof(buffer), format, arguments);
   va_end(arguments);
   Serial.print(buffer);
+  ScopedSdLock lock;
   if (diagnosticFile) {
     diagnosticFile.print(buffer);
     diagnosticFile.flush();
@@ -60,6 +82,8 @@ void logDiagnostic(const char* format, ...) {
 }
 
 bool initializeSd() {
+  ScopedSdLock lock;
+  if (!lock) return false;
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("[SD] Mount FAILED");
@@ -70,6 +94,8 @@ bool initializeSd() {
 }
 
 bool writeInitialExports() {
+  ScopedSdLock lock;
+  if (!lock) return false;
   char path[80];
   snprintf(path, sizeof(path), "%s/gpslog.csv", trackingSessionDirectory);
   csvFile = SD.open(path, FILE_WRITE);
@@ -89,6 +115,8 @@ bool writeInitialExports() {
 class Esp32TrackingStorage : public tracking::TrackingStorage {
  public:
   bool recoverPersistedSessions() {
+    ScopedSdLock lock;
+    if (!lock) return false;
     std::vector<tracking::StoredTrackingSession> storedSessions;
     File root = SD.open("/");
     if (!root || !root.isDirectory()) return false;
@@ -140,6 +168,8 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
 
   bool confirmDeliveryThrough(uint32_t trackingSessionNumber,
                               uint32_t highestConfirmedPoint) {
+    ScopedSdLock lock;
+    if (!lock) return false;
     char path[80];
     snprintf(path, sizeof(path), "/session-%010lu/delivery-state.log",
              static_cast<unsigned long>(trackingSessionNumber));
@@ -150,10 +180,62 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     const size_t written = stateFile.print(record.c_str());
     stateFile.flush();
     stateFile.close();
-    return written == record.size();
+    if (written != record.size()) return false;
+    for (std::vector<tracking::RecoveredTrackingSession>::iterator it =
+             recoveredSessions_.begin();
+         it != recoveredSessions_.end(); ++it) {
+      if (it->trackingSessionNumber == trackingSessionNumber &&
+          highestConfirmedPoint > it->highestConfirmedPoint &&
+          highestConfirmedPoint <= it->highestRecordedPoint) {
+        it->highestConfirmedPoint = highestConfirmedPoint;
+        break;
+      }
+    }
+    return true;
+  }
+
+  bool readFullPendingBatch(tracking::UploadBatch& batch) {
+    ScopedSdLock lock;
+    if (!lock) return false;
+    for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
+             recoveredSessions_.begin();
+         it != recoveredSessions_.end(); ++it) {
+      if (it->highestRecordedPoint - it->highestConfirmedPoint < 30) continue;
+
+      char path[80];
+      snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
+               static_cast<unsigned long>(it->trackingSessionNumber));
+      File points = SD.open(path, FILE_READ);
+      if (!points) return false;
+
+      uint32_t pointNumber = 0;
+      batch = tracking::UploadBatch();
+      batch.trackerId = TRACKER_ID;
+      batch.trackingSessionNumber = it->trackingSessionNumber;
+      batch.firstPointNumber = it->highestConfirmedPoint + 1;
+      while (points.available() && batch.ndjsonPoints.size() < 30) {
+        String line = points.readStringUntil('\n');
+        ++pointNumber;
+        if (pointNumber < batch.firstPointNumber) continue;
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
+        if (line.length() == 0) {
+          points.close();
+          return false;
+        }
+        batch.ndjsonPoints.push_back(
+            std::string(line.c_str(), static_cast<size_t>(line.length())));
+      }
+      points.close();
+      if (batch.ndjsonPoints.size() == 30) return true;
+      batch = tracking::UploadBatch();
+      return false;
+    }
+    return false;
   }
 
   bool startTrackingSession(uint32_t& trackingSessionNumber) override {
+    ScopedSdLock lock;
+    if (!lock) return false;
     if (!SD.cardSize()) return false;
 
     Preferences preferences;
@@ -194,6 +276,10 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     if (!diagnosticFile) return false;
 
     trackingSessionNumber = candidate;
+    tracking::RecoveredTrackingSession activeSession;
+    activeSession.trackingSessionNumber = candidate;
+    activeSession.inactive = false;
+    recoveredSessions_.push_back(activeSession);
     logDiagnostic("[SESSION] Started number=%lu directory=%s\n",
                   static_cast<unsigned long>(candidate),
                   trackingSessionDirectory);
@@ -202,11 +288,18 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
 
   bool appendAndFlushRawPoint(const tracking::TrackPoint&,
                               const std::string& ndjson) override {
+    ScopedSdLock lock;
+    if (!lock) return false;
     if (!rawPointFile) return false;
     const size_t bodyWritten = rawPointFile.print(ndjson.c_str());
     const size_t newlineWritten = rawPointFile.print('\n');
     rawPointFile.flush();
-    return bodyWritten == ndjson.size() && newlineWritten == 1;
+    if (bodyWritten != ndjson.size() || newlineWritten != 1) return false;
+    if (!recoveredSessions_.empty() && !recoveredSessions_.back().inactive &&
+        recoveredSessions_.back().highestRecordedPoint != UINT32_MAX) {
+      ++recoveredSessions_.back().highestRecordedPoint;
+    }
+    return true;
   }
 
  private:
@@ -263,6 +356,8 @@ void printOptional(File& file, const tracking::OptionalDouble& value,
 }
 
 void writeCsv(const tracking::TrackPoint& point) {
+  ScopedSdLock lock;
+  if (!lock) return;
   if (!csvFile) return;
   csvFile.print(pointTimestamp(point));
   csvFile.print(',');
@@ -284,6 +379,8 @@ void writeCsv(const tracking::TrackPoint& point) {
 }
 
 void writeGpx(const tracking::TrackPoint& point) {
+  ScopedSdLock lock;
+  if (!lock) return;
   if (!gpxFile) return;
   const size_t currentSize = gpxFile.size();
   if (currentSize >= GPX_TAIL_LENGTH) {
@@ -341,6 +438,77 @@ tracking::GpsFix currentGpsFix(uint32_t now) {
   return fix;
 }
 
+void uploadOneBatch(void*) {
+  tracking::UploadBatch batch;
+  while (!storage.readFullPendingBatch(batch)) vTaskDelay(pdMS_TO_TICKS(1000));
+
+  tracking::UploadRequest request;
+  if (!tracking::buildUploadRequest(UPLOAD_URL, TRACKER_TOKEN, batch, request)) {
+    logDiagnostic("[UPLOAD] Invalid local configuration or point range\n");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(HOTSPOT_NAME, HOTSPOT_PASSWORD);
+  const uint32_t connectionStartedAt = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - connectionStartedAt < NETWORK_TIMEOUT_MS) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    logDiagnostic("[UPLOAD] Wi-Fi connection failed; points remain pending\n");
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  WiFiClientSecure tlsClient;
+  tlsClient.setCACert(UPLOAD_ROOT_CA_CERTIFICATE);
+  tlsClient.setTimeout(NETWORK_TIMEOUT_MS);
+  HTTPClient http;
+  http.setTimeout(NETWORK_TIMEOUT_MS);
+  if (!http.begin(tlsClient, request.url.c_str())) {
+    logDiagnostic("[UPLOAD] HTTPS setup failed; points remain pending\n");
+    vTaskDelete(nullptr);
+    return;
+  }
+  for (std::vector<tracking::UploadRequest::Header>::const_iterator it =
+           request.headers.begin();
+       it != request.headers.end(); ++it) {
+    http.addHeader(it->name.c_str(), it->value.c_str());
+  }
+
+  const int statusCode = http.POST(
+      reinterpret_cast<uint8_t*>(const_cast<char*>(request.body.data())),
+      request.body.size());
+  const String response = statusCode > 0 ? http.getString() : String();
+  http.end();
+
+  tracking::UploadConfirmation confirmation;
+  if (!tracking::validateUploadResponse(
+          statusCode, std::string(response.c_str(), response.length()), batch,
+          confirmation)) {
+    logDiagnostic(
+        "[UPLOAD] HTTPS response rejected status=%d; points remain pending\n",
+        statusCode);
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  const uint32_t lastPoint = batch.firstPointNumber +
+      static_cast<uint32_t>(batch.ndjsonPoints.size()) - 1;
+  if (storage.confirmDeliveryThrough(batch.trackingSessionNumber, lastPoint)) {
+    logDiagnostic("[UPLOAD] Confirmed session=%lu points=%lu-%lu\n",
+                  static_cast<unsigned long>(batch.trackingSessionNumber),
+                  static_cast<unsigned long>(batch.firstPointNumber),
+                  static_cast<unsigned long>(lastPoint));
+  } else {
+    logDiagnostic(
+        "[UPLOAD] Confirmation persistence failed; points remain pending\n");
+  }
+  vTaskDelete(nullptr);
+}
+
 }  // namespace
 
 void setup() {
@@ -348,8 +516,16 @@ void setup() {
   const uint32_t serialStartedAt = millis();
   while (!Serial && millis() - serialStartedAt < 3000) delay(10);
   Serial.println("\n=== ESP32 Motorcycle Tracker ===");
-  if (initializeSd() && !storage.recoverPersistedSessions()) {
-    logDiagnostic("[RECOVERY] SD session scan FAILED\n");
+  sdMutex = xSemaphoreCreateRecursiveMutex();
+  const bool sdReady = initializeSd();
+  if (sdReady) {
+    if (!storage.recoverPersistedSessions()) {
+      logDiagnostic("[RECOVERY] SD session scan FAILED\n");
+    } else if (xTaskCreatePinnedToCore(uploadOneBatch, "track-upload", 8192,
+                                      nullptr, 0, nullptr, 0) !=
+               pdPASS) {
+      logDiagnostic("[UPLOAD] Background task start failed\n");
+    }
   }
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.printf("[GPS] UART RX=%d TX=%d baud=%lu\n", GPS_RX_PIN, GPS_TX_PIN,
