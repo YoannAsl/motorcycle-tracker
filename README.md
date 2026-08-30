@@ -42,7 +42,7 @@ The ESP32 connects only as a Wi-Fi station. It does not start an access point, c
 
 ## Track point delivery
 
-One background task waits for 30 pending points from one tracking session. It copies those ordered NDJSON lines into memory and closes the SD file before it starts the HTTPS request. DNS, connection, TLS, and response delays therefore run outside the GPS loop. SD operations use a shared mutex, and the upload task runs below the recording task's priority.
+One background task drains the oldest eligible pending range across all tracking sessions. An active session exposes only complete 30-point batches; sessions recovered at boot also expose their final batch when it contains fewer than 30 points. The task copies at most 30 ordered NDJSON lines into memory and closes the SD file before it starts the HTTPS request. DNS, connection, TLS, retry waits, and response delays therefore run outside the GPS loop. SD operations use a shared mutex, and the upload task runs below the recording task's priority.
 
 The task posts to the configured `/v1/track-point-batches` path with `application/x-ndjson`, bearer authentication, and these metadata headers:
 
@@ -52,7 +52,7 @@ The task posts to the configured `/v1/track-point-batches` path with `applicatio
 - `X-First-Point-Number`
 - `X-Last-Point-Number`
 
-TLS uses the configured root CA. There is no insecure mode. The tracker advances local delivery progress only for a 2xx JSON response whose tracker and tracking session identities match and whose `highest_stored_point_number` covers the sent range. Network errors, non-2xx responses, malformed responses, identity mismatches, and incomplete confirmations leave the points pending. A repeated request is safe because stable identities and point numbers describe the same range.
+TLS uses the configured root CA. There is no insecure mode. The tracker advances local delivery progress only for a 2xx JSON response whose tracker and tracking session identities match and whose `highest_stored_point_number` covers the sent range. Network errors, non-2xx responses, malformed responses, identity mismatches, incomplete confirmations, and local confirmation-write failures leave the points pending. Failed attempts retry after 15, 30, 60, and 120 seconds, then every 300 seconds; a confirmed and persisted delivery resets that sequence. A repeated request is safe because stable identities and point numbers describe the same range.
 
 ## When recording starts
 
