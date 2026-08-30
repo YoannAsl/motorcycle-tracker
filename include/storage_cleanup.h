@@ -16,8 +16,12 @@ struct CleanupSession {
 struct CleanupPlan {
   bool started = false;
   bool targetReached = false;
+  bool protectedDataRemains = false;
   std::vector<uint32_t> sessionsToDelete;
 };
+
+bool storageCleanupRequired(uint64_t capacityBytes, uint64_t usedBytes);
+bool storageCleanupTargetReached(uint64_t capacityBytes, uint64_t usedBytes);
 
 CleanupPlan planStorageCleanup(
     uint64_t capacityBytes, uint64_t usedBytes,
