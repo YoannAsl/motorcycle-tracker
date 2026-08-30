@@ -58,6 +58,7 @@ class TrackingStorage {
 struct TrackingDecision {
   bool trackingSessionStarted = false;
   bool rawPointRecorded = false;
+  bool rawPointWriteFailed = false;
   bool writeFilteredCsv = false;
   bool writeFilteredGpx = false;
   TrackPoint point;

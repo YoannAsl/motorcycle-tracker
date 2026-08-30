@@ -126,7 +126,10 @@ TrackingDecision TrackingWorkflow::processFix(const GpsFix& fix,
   decision.point =
       makePoint(fix, trackerId_, trackingSessionNumber_, nextPointNumber_);
   const std::string ndjson = serializeTrackPoint(decision.point);
-  if (!storage.appendAndFlushRawPoint(decision.point, ndjson)) return decision;
+  if (!storage.appendAndFlushRawPoint(decision.point, ndjson)) {
+    decision.rawPointWriteFailed = true;
+    return decision;
+  }
 
   decision.rawPointRecorded = true;
   decision.writeFilteredCsv =
