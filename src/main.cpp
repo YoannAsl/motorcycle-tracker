@@ -9,10 +9,12 @@
 #include <TinyGPSPlus.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_system.h>
 #include <freertos/semphr.h>
 
 #include "delivery_recovery.h"
 #include "delivery_scheduler.h"
+#include "diagnostic_log.h"
 #include "tracking_workflow.h"
 #include "upload_contract.h"
 
@@ -53,6 +55,7 @@ char trackingSessionDirectory[48];
 uint32_t rawPointsRecorded = 0;
 uint32_t noFreshLocationCount = 0;
 SemaphoreHandle_t sdMutex = nullptr;
+std::string diagnosticBacklog;
 
 class ScopedSdLock {
  public:
@@ -79,6 +82,8 @@ void logDiagnostic(const char* format, ...) {
   if (diagnosticFile) {
     diagnosticFile.print(buffer);
     diagnosticFile.flush();
+  } else {
+    diagnosticBacklog += buffer;
   }
 }
 
@@ -119,6 +124,7 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     ScopedSdLock lock;
     if (!lock) return false;
     std::vector<tracking::StoredTrackingSession> storedSessions;
+    storedDiagnosticLogs_.clear();
     File root = SD.open("/");
     if (!root || !root.isDirectory()) return false;
 
@@ -142,6 +148,17 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
                  static_cast<unsigned long>(trackingSessionNumber));
         stored.deliveryState = readFile(path);
         storedSessions.push_back(stored);
+
+        tracking::StoredDiagnosticLog diagnostic;
+        diagnostic.trackingSessionNumber = trackingSessionNumber;
+        snprintf(path, sizeof(path), "/session-%010lu/session.log",
+                 static_cast<unsigned long>(trackingSessionNumber));
+        diagnostic.contents = readFile(path);
+        snprintf(path, sizeof(path),
+                 "/session-%010lu/diagnostic-delivery-state.log",
+                 static_cast<unsigned long>(trackingSessionNumber));
+        diagnostic.deliveryState = readFile(path);
+        storedDiagnosticLogs_.push_back(diagnostic);
       }
       entry.close();
       entry = root.openNextFile();
@@ -193,6 +210,39 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
       }
     }
     return true;
+  }
+
+  bool readPendingDiagnosticLog(tracking::DiagnosticLogUpload& upload) {
+    ScopedSdLock lock;
+    if (!lock) return false;
+    return tracking::selectOldestPendingDiagnosticLog(
+        TRACKER_ID, storedDiagnosticLogs_, upload);
+  }
+
+  bool confirmDiagnosticDelivery(uint32_t trackingSessionNumber) {
+    ScopedSdLock lock;
+    if (!lock) return false;
+    char path[96];
+    snprintf(path, sizeof(path),
+             "/session-%010lu/diagnostic-delivery-state.log",
+             static_cast<unsigned long>(trackingSessionNumber));
+    File stateFile = SD.open(path, FILE_APPEND);
+    if (!stateFile) return false;
+    const std::string record = tracking::serializeDiagnosticDelivery(
+        TRACKER_ID, trackingSessionNumber);
+    const size_t written = stateFile.print(record.c_str());
+    stateFile.flush();
+    stateFile.close();
+    if (written != record.size()) return false;
+    for (std::vector<tracking::StoredDiagnosticLog>::iterator it =
+             storedDiagnosticLogs_.begin();
+         it != storedDiagnosticLogs_.end(); ++it) {
+      if (it->trackingSessionNumber == trackingSessionNumber) {
+        it->deliveryState += record;
+        return true;
+      }
+    }
+    return false;
   }
 
   bool readPendingBatch(tracking::UploadBatch& batch) {
@@ -276,6 +326,11 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     snprintf(path, sizeof(path), "%s/session.log", trackingSessionDirectory);
     diagnosticFile = SD.open(path, FILE_WRITE);
     if (!diagnosticFile) return false;
+    if (!diagnosticBacklog.empty()) {
+      diagnosticFile.print(diagnosticBacklog.c_str());
+      diagnosticFile.flush();
+      diagnosticBacklog.clear();
+    }
 
     trackingSessionNumber = candidate;
     tracking::RecoveredTrackingSession activeSession;
@@ -342,6 +397,7 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
 
   uint32_t maxStoredTrackingSessionNumber_ = 0;
   std::vector<tracking::RecoveredTrackingSession> recoveredSessions_;
+  std::vector<tracking::StoredDiagnosticLog> storedDiagnosticLogs_;
 };
 
 Esp32TrackingStorage storage;
@@ -440,14 +496,128 @@ tracking::GpsFix currentGpsFix(uint32_t now) {
   return fix;
 }
 
-bool uploadBatch(const tracking::UploadBatch& batch) {
-  tracking::UploadRequest request;
-  if (!tracking::buildUploadRequest(UPLOAD_URL, TRACKER_TOKEN, batch, request)) {
-    logDiagnostic("[UPLOAD] Invalid local configuration or point range\n");
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT: return "task-watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+  }
+}
+
+std::string diagnosticUploadUrl() {
+  const std::string pointUrl(UPLOAD_URL);
+  const size_t path = pointUrl.find('/', 8);
+  if (pointUrl.compare(0, 8, "https://") != 0 || path == std::string::npos) {
+    return std::string();
+  }
+  return pointUrl.substr(0, path) + "/v1/diagnostic-logs";
+}
+
+bool uploadDiagnosticLog(const tracking::DiagnosticLogUpload& upload) {
+  tracking::DiagnosticUploadRequest request;
+  if (!tracking::buildDiagnosticUploadRequest(
+          diagnosticUploadUrl(), TRACKER_TOKEN, upload, request)) {
+    logDiagnostic("[ERROR] diagnostic upload configuration invalid\n");
     return false;
   }
 
+  logDiagnostic("[UPLOAD] diagnostic attempt session=%lu\n",
+                static_cast<unsigned long>(upload.trackingSessionNumber));
+  logDiagnostic("[WIFI] connecting for diagnostic upload\n");
   WiFi.mode(WIFI_STA);
+  WiFi.begin(HOTSPOT_NAME, HOTSPOT_PASSWORD);
+  const uint32_t connectionStartedAt = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - connectionStartedAt < NETWORK_TIMEOUT_MS) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    logDiagnostic("[UPLOAD] diagnostic result=%s\n",
+                  tracking::diagnosticUploadFailureMessage(
+                      tracking::DiagnosticUploadFailure::Wifi)
+                      .c_str());
+    return false;
+  }
+  logDiagnostic("[WIFI] connected for diagnostic upload\n");
+
+  WiFiClientSecure tlsClient;
+  tlsClient.setCACert(UPLOAD_ROOT_CA_CERTIFICATE);
+  tlsClient.setTimeout(NETWORK_TIMEOUT_MS);
+  HTTPClient http;
+  http.setTimeout(NETWORK_TIMEOUT_MS);
+  if (!http.begin(tlsClient, request.url.c_str())) {
+    logDiagnostic("[UPLOAD] diagnostic result=%s\n",
+                  tracking::diagnosticUploadFailureMessage(
+                      tracking::DiagnosticUploadFailure::Tls)
+                      .c_str());
+    return false;
+  }
+  for (std::vector<tracking::DiagnosticUploadRequest::Header>::const_iterator it =
+           request.headers.begin();
+       it != request.headers.end(); ++it) {
+    http.addHeader(it->name.c_str(), it->value.c_str());
+  }
+  const int statusCode = http.POST(
+      reinterpret_cast<uint8_t*>(const_cast<char*>(request.body.data())),
+      request.body.size());
+  const String response = statusCode > 0 ? http.getString() : String();
+  http.end();
+  logDiagnostic("[CLEANUP] diagnostic HTTPS client closed\n");
+
+  if (!tracking::validateDiagnosticUploadResponse(
+          statusCode, std::string(response.c_str(), response.length()),
+          upload)) {
+    tracking::DiagnosticUploadFailure failure =
+        tracking::DiagnosticUploadFailure::MalformedResponse;
+    if (statusCode == 401 || statusCode == 403) {
+      failure = tracking::DiagnosticUploadFailure::Authentication;
+    } else if (statusCode >= 400 && statusCode < 600) {
+      failure = tracking::DiagnosticUploadFailure::Server;
+    } else if (statusCode == HTTPC_ERROR_READ_TIMEOUT) {
+      failure = tracking::DiagnosticUploadFailure::Timeout;
+    } else if (statusCode < 0) {
+      failure = tracking::DiagnosticUploadFailure::Tls;
+    }
+    logDiagnostic("[UPLOAD] diagnostic result=%s status=%d\n",
+                  tracking::diagnosticUploadFailureMessage(failure).c_str(),
+                  statusCode);
+    return false;
+  }
+
+  if (!storage.confirmDiagnosticDelivery(upload.trackingSessionNumber)) {
+    logDiagnostic(
+        "[ERROR] diagnostic confirmation persistence failed session=%lu\n",
+        static_cast<unsigned long>(upload.trackingSessionNumber));
+    return false;
+  }
+  logDiagnostic("[UPLOAD] diagnostic result=confirmed session=%lu\n",
+                static_cast<unsigned long>(upload.trackingSessionNumber));
+  return true;
+}
+
+bool uploadBatch(const tracking::UploadBatch& batch) {
+  tracking::UploadRequest request;
+  if (!tracking::buildUploadRequest(UPLOAD_URL, TRACKER_TOKEN, batch, request)) {
+    logDiagnostic("[ERROR] track-point upload configuration or range invalid\n");
+    return false;
+  }
+
+  logDiagnostic("[UPLOAD] track-points attempt session=%lu points=%lu-%lu\n",
+                static_cast<unsigned long>(batch.trackingSessionNumber),
+                static_cast<unsigned long>(batch.firstPointNumber),
+                static_cast<unsigned long>(
+                    batch.firstPointNumber + batch.ndjsonPoints.size() - 1));
+
+  WiFi.mode(WIFI_STA);
+  logDiagnostic("[WIFI] connecting for track-point upload\n");
   WiFi.begin(HOTSPOT_NAME, HOTSPOT_PASSWORD);
   const uint32_t connectionStartedAt = millis();
   while (WiFi.status() != WL_CONNECTED &&
@@ -458,6 +628,7 @@ bool uploadBatch(const tracking::UploadBatch& batch) {
     logDiagnostic("[UPLOAD] Wi-Fi connection failed; points remain pending\n");
     return false;
   }
+  logDiagnostic("[WIFI] connected for track-point upload\n");
 
   WiFiClientSecure tlsClient;
   tlsClient.setCACert(UPLOAD_ROOT_CA_CERTIFICATE);
@@ -479,14 +650,26 @@ bool uploadBatch(const tracking::UploadBatch& batch) {
       request.body.size());
   const String response = statusCode > 0 ? http.getString() : String();
   http.end();
+  logDiagnostic("[CLEANUP] track-point HTTPS client closed\n");
 
   tracking::UploadConfirmation confirmation;
   if (!tracking::validateUploadResponse(
           statusCode, std::string(response.c_str(), response.length()), batch,
           confirmation)) {
+    tracking::DiagnosticUploadFailure failure =
+        tracking::DiagnosticUploadFailure::MalformedResponse;
+    if (statusCode == 401 || statusCode == 403) {
+      failure = tracking::DiagnosticUploadFailure::Authentication;
+    } else if (statusCode >= 400 && statusCode < 600) {
+      failure = tracking::DiagnosticUploadFailure::Server;
+    } else if (statusCode == HTTPC_ERROR_READ_TIMEOUT) {
+      failure = tracking::DiagnosticUploadFailure::Timeout;
+    } else if (statusCode < 0) {
+      failure = tracking::DiagnosticUploadFailure::Tls;
+    }
     logDiagnostic(
-        "[UPLOAD] HTTPS response rejected status=%d; points remain pending\n",
-        statusCode);
+        "[UPLOAD] track-points result=%s status=%d; points remain pending\n",
+        tracking::diagnosticUploadFailureMessage(failure).c_str(), statusCode);
     return false;
   }
 
@@ -506,21 +689,39 @@ bool uploadBatch(const tracking::UploadBatch& batch) {
 }
 
 void uploadPendingData(void*) {
-  tracking::DeliveryRetrySchedule retry;
+  tracking::DeliveryRetrySchedule diagnosticRetry;
+  tracking::DeliveryRetrySchedule pointRetry;
   while (true) {
+    bool foundPendingData = false;
+    uint32_t retrySeconds = 0;
+    tracking::DiagnosticLogUpload diagnostic;
+    if (storage.readPendingDiagnosticLog(diagnostic)) {
+      foundPendingData = true;
+      if (uploadDiagnosticLog(diagnostic)) {
+        diagnosticRetry.recordSuccess();
+      } else {
+        retrySeconds = diagnosticRetry.recordFailure();
+        logDiagnostic("[UPLOAD] Retrying pending diagnostic in %lu seconds\n",
+                      static_cast<unsigned long>(retrySeconds));
+      }
+    }
     tracking::UploadBatch batch;
-    if (!storage.readPendingBatch(batch)) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
+    if (storage.readPendingBatch(batch)) {
+      foundPendingData = true;
+      if (uploadBatch(batch)) {
+        pointRetry.recordSuccess();
+      } else {
+        const uint32_t pointRetrySeconds = pointRetry.recordFailure();
+        if (retrySeconds == 0 || pointRetrySeconds < retrySeconds) {
+          retrySeconds = pointRetrySeconds;
+        }
+        logDiagnostic("[UPLOAD] Retrying pending points in %lu seconds\n",
+                      static_cast<unsigned long>(pointRetrySeconds));
+      }
     }
-    if (uploadBatch(batch)) {
-      retry.recordSuccess();
-      continue;
-    }
-    const uint32_t retrySeconds = retry.recordFailure();
-    logDiagnostic("[UPLOAD] Retrying pending data in %lu seconds\n",
-                  static_cast<unsigned long>(retrySeconds));
-    vTaskDelay(pdMS_TO_TICKS(retrySeconds * 1000));
+    vTaskDelay(pdMS_TO_TICKS(
+        (retrySeconds == 0 ? (foundPendingData ? 0 : 1) : retrySeconds) *
+        1000));
   }
 }
 
@@ -531,6 +732,7 @@ void setup() {
   const uint32_t serialStartedAt = millis();
   while (!Serial && millis() - serialStartedAt < 3000) delay(10);
   Serial.println("\n=== ESP32 Motorcycle Tracker ===");
+  logDiagnostic("[BOOT] reset=%s\n", resetReasonName(esp_reset_reason()));
   sdMutex = xSemaphoreCreateRecursiveMutex();
   const bool sdReady = initializeSd();
   if (sdReady) {
@@ -571,7 +773,7 @@ void loop() {
 
   if (workflow.trackingSessionActive() && now - lastHeartbeat >= 60000) {
     lastHeartbeat = now;
-    logDiagnostic("[HB] uptime_ms=%lu raw_points=%lu no_fresh_location=%lu\n",
+    logDiagnostic("[HEALTH] uptime_ms=%lu raw_points=%lu no_fresh_location=%lu\n",
                   static_cast<unsigned long>(now),
                   static_cast<unsigned long>(rawPointsRecorded),
                   static_cast<unsigned long>(noFreshLocationCount));
