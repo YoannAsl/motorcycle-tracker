@@ -197,8 +197,10 @@ void failed_raw_append_is_not_treated_as_recorded() {
 
   TEST_ASSERT_TRUE(failed.trackingSessionStarted);
   TEST_ASSERT_FALSE(failed.rawPointRecorded);
+  TEST_ASSERT_TRUE(failed.rawPointWriteFailed);
   TEST_ASSERT_FALSE(failed.writeFilteredCsv);
   TEST_ASSERT_TRUE(retried.rawPointRecorded);
+  TEST_ASSERT_FALSE(retried.rawPointWriteFailed);
   TEST_ASSERT_EQUAL_UINT32(1, retried.point.pointNumber);
 }
 

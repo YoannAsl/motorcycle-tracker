@@ -258,8 +258,9 @@ void loop() {
       ++rawPointsRecorded;
       if (decision.writeFilteredCsv) writeCsv(decision.point);
       if (decision.writeFilteredGpx) writeGpx(decision.point);
-    } else if (decision.trackingSessionStarted) {
-      logDiagnostic("[SD] Raw point append/flush FAILED\n");
+    } else if (decision.rawPointWriteFailed) {
+      logDiagnostic("[SD] Raw point %lu append/flush FAILED\n",
+                    static_cast<unsigned long>(decision.point.pointNumber));
     }
   }
 
