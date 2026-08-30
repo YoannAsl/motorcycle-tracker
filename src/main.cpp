@@ -15,6 +15,7 @@
 #include "delivery_recovery.h"
 #include "delivery_scheduler.h"
 #include "diagnostic_log.h"
+#include "storage_cleanup.h"
 #include "tracking_workflow.h"
 #include "upload_contract.h"
 
@@ -209,6 +210,7 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
         break;
       }
     }
+    cleanupDeliveredSessions();
     return true;
   }
 
@@ -239,6 +241,7 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
          it != storedDiagnosticLogs_.end(); ++it) {
       if (it->trackingSessionNumber == trackingSessionNumber) {
         it->deliveryState += record;
+        cleanupDeliveredSessions();
         return true;
       }
     }
@@ -356,7 +359,90 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
         recoveredSessions_.back().highestRecordedPoint != UINT32_MAX) {
       ++recoveredSessions_.back().highestRecordedPoint;
     }
+    cleanupDeliveredSessions();
     return true;
+  }
+
+  void cleanupDeliveredSessions() {
+    ScopedSdLock lock;
+    if (!lock) return;
+    const uint64_t capacityBytes = SD.cardSize();
+    const uint64_t usedBytes = SD.usedBytes();
+    if (!tracking::storageCleanupRequired(capacityBytes, usedBytes)) {
+      cleanupBlockedLogged_ = false;
+      return;
+    }
+    std::vector<tracking::CleanupSession> sessions;
+    for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
+             recoveredSessions_.begin();
+         it != recoveredSessions_.end(); ++it) {
+      tracking::CleanupSession candidate;
+      candidate.trackingSessionNumber = it->trackingSessionNumber;
+      candidate.inactive = it->inactive;
+      candidate.allPointsConfirmed =
+          it->highestConfirmedPoint >= it->highestRecordedPoint;
+      candidate.diagnosticLogConfirmed = diagnosticDelivered(
+          it->trackingSessionNumber);
+      char path[48];
+      snprintf(path, sizeof(path), "/session-%010lu",
+               static_cast<unsigned long>(it->trackingSessionNumber));
+      candidate.bytes = treeSize(path);
+      sessions.push_back(candidate);
+    }
+
+    const tracking::CleanupPlan plan = tracking::planStorageCleanup(
+        capacityBytes, usedBytes, sessions);
+    if (!plan.started) {
+      cleanupBlockedLogged_ = false;
+      return;
+    }
+    for (std::vector<uint32_t>::const_iterator number =
+             plan.sessionsToDelete.begin();
+         number != plan.sessionsToDelete.end(); ++number) {
+      if (tracking::storageCleanupTargetReached(capacityBytes,
+                                                SD.usedBytes())) {
+        break;
+      }
+      const uint32_t deletedSessionNumber = *number;
+      char path[48];
+      snprintf(path, sizeof(path), "/session-%010lu",
+               static_cast<unsigned long>(deletedSessionNumber));
+      if (!removeTree(path)) {
+        logDiagnostic("[ERROR] cleanup delete failed session=%lu\n",
+                      static_cast<unsigned long>(deletedSessionNumber));
+        continue;
+      }
+      recoveredSessions_.erase(
+          std::remove_if(recoveredSessions_.begin(), recoveredSessions_.end(),
+                         [deletedSessionNumber](
+                             const tracking::RecoveredTrackingSession& item) {
+                           return item.trackingSessionNumber ==
+                                  deletedSessionNumber;
+                         }),
+          recoveredSessions_.end());
+      storedDiagnosticLogs_.erase(
+          std::remove_if(storedDiagnosticLogs_.begin(),
+                         storedDiagnosticLogs_.end(),
+                         [deletedSessionNumber](
+                             const tracking::StoredDiagnosticLog& item) {
+                           return item.trackingSessionNumber ==
+                                  deletedSessionNumber;
+                         }),
+          storedDiagnosticLogs_.end());
+      logDiagnostic("[CLEANUP] deleted delivered session=%lu\n",
+                    static_cast<unsigned long>(deletedSessionNumber));
+    }
+
+    const bool targetReached =
+        tracking::storageCleanupTargetReached(capacityBytes, SD.usedBytes());
+    if (!targetReached && plan.protectedDataRemains &&
+        !cleanupBlockedLogged_) {
+      logDiagnostic(
+          "[CLEANUP] unable to reach below 70 percent; pending data protected\n");
+      cleanupBlockedLogged_ = true;
+    } else if (targetReached) {
+      cleanupBlockedLogged_ = false;
+    }
   }
 
  private:
@@ -395,9 +481,59 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     return contents;
   }
 
+  bool diagnosticDelivered(uint32_t trackingSessionNumber) const {
+    for (std::vector<tracking::StoredDiagnosticLog>::const_iterator it =
+             storedDiagnosticLogs_.begin();
+         it != storedDiagnosticLogs_.end(); ++it) {
+      if (it->trackingSessionNumber == trackingSessionNumber) {
+        return it->deliveryState.find(tracking::serializeDiagnosticDelivery(
+                   TRACKER_ID, trackingSessionNumber)) != std::string::npos;
+      }
+    }
+    return false;
+  }
+
+  static uint64_t treeSize(const char* path) {
+    File directory = SD.open(path);
+    if (!directory || !directory.isDirectory()) return 0;
+    uint64_t bytes = 0;
+    File entry = directory.openNextFile();
+    while (entry) {
+      if (entry.isDirectory()) {
+        bytes += treeSize(entry.path());
+      } else {
+        bytes += entry.size();
+      }
+      entry.close();
+      entry = directory.openNextFile();
+    }
+    directory.close();
+    return bytes;
+  }
+
+  static bool removeTree(const char* path) {
+    File directory = SD.open(path);
+    if (!directory || !directory.isDirectory()) return false;
+    File entry = directory.openNextFile();
+    while (entry) {
+      const std::string childPath = entry.path();
+      const bool childIsDirectory = entry.isDirectory();
+      entry.close();
+      if (childIsDirectory ? !removeTree(childPath.c_str())
+                           : !SD.remove(childPath.c_str())) {
+        directory.close();
+        return false;
+      }
+      entry = directory.openNextFile();
+    }
+    directory.close();
+    return SD.rmdir(path);
+  }
+
   uint32_t maxStoredTrackingSessionNumber_ = 0;
   std::vector<tracking::RecoveredTrackingSession> recoveredSessions_;
   std::vector<tracking::StoredDiagnosticLog> storedDiagnosticLogs_;
+  bool cleanupBlockedLogged_ = false;
 };
 
 Esp32TrackingStorage storage;
@@ -738,10 +874,12 @@ void setup() {
   if (sdReady) {
     if (!storage.recoverPersistedSessions()) {
       logDiagnostic("[RECOVERY] SD session scan FAILED\n");
-    } else if (xTaskCreatePinnedToCore(uploadPendingData, "track-upload", 8192,
-                                      nullptr, 0, nullptr, 0) !=
-               pdPASS) {
-      logDiagnostic("[UPLOAD] Background task start failed\n");
+    } else {
+      storage.cleanupDeliveredSessions();
+      if (xTaskCreatePinnedToCore(uploadPendingData, "track-upload", 8192,
+                                nullptr, 0, nullptr, 0) != pdPASS) {
+        logDiagnostic("[UPLOAD] Background task start failed\n");
+      }
     }
   }
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
