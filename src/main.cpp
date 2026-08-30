@@ -7,6 +7,7 @@
 #include <SPI.h>
 #include <TinyGPSPlus.h>
 
+#include "delivery_recovery.h"
 #include "tracking_workflow.h"
 
 #if __has_include("tracker_config.h")
@@ -87,12 +88,84 @@ bool writeInitialExports() {
 
 class Esp32TrackingStorage : public tracking::TrackingStorage {
  public:
+  bool recoverPersistedSessions() {
+    std::vector<tracking::StoredTrackingSession> storedSessions;
+    File root = SD.open("/");
+    if (!root || !root.isDirectory()) return false;
+
+    maxStoredTrackingSessionNumber_ = 0;
+    File entry = root.openNextFile();
+    while (entry) {
+      uint32_t trackingSessionNumber = 0;
+      if (entry.isDirectory() &&
+          parseTrackingSessionNumber(entry.name(), trackingSessionNumber)) {
+        if (trackingSessionNumber > maxStoredTrackingSessionNumber_) {
+          maxStoredTrackingSessionNumber_ = trackingSessionNumber;
+        }
+
+        tracking::StoredTrackingSession stored;
+        stored.trackingSessionNumber = trackingSessionNumber;
+        char path[80];
+        snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
+                 static_cast<unsigned long>(trackingSessionNumber));
+        stored.highestRecordedPoint = countCompleteLines(path);
+        snprintf(path, sizeof(path), "/session-%010lu/delivery-state.log",
+                 static_cast<unsigned long>(trackingSessionNumber));
+        stored.deliveryState = readFile(path);
+        storedSessions.push_back(stored);
+      }
+      entry.close();
+      entry = root.openNextFile();
+    }
+    root.close();
+
+    recoveredSessions_ = tracking::recoverTrackingSessions(storedSessions);
+    for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
+             recoveredSessions_.begin();
+         it != recoveredSessions_.end(); ++it) {
+      logDiagnostic(
+          "[RECOVERY] session=%lu recorded=%lu confirmed=%lu status=%s\n",
+          static_cast<unsigned long>(it->trackingSessionNumber),
+          static_cast<unsigned long>(it->highestRecordedPoint),
+          static_cast<unsigned long>(it->highestConfirmedPoint),
+          it->recoveryRequired ? "safe-resend" : "clean");
+    }
+    return true;
+  }
+
+  const std::vector<tracking::RecoveredTrackingSession>& recoveredSessions()
+      const {
+    return recoveredSessions_;
+  }
+
+  bool confirmDeliveryThrough(uint32_t trackingSessionNumber,
+                              uint32_t highestConfirmedPoint) {
+    char path[80];
+    snprintf(path, sizeof(path), "/session-%010lu/delivery-state.log",
+             static_cast<unsigned long>(trackingSessionNumber));
+    File stateFile = SD.open(path, FILE_APPEND);
+    if (!stateFile) return false;
+    const std::string record = tracking::serializeDeliveryProgress(
+        trackingSessionNumber, highestConfirmedPoint);
+    const size_t written = stateFile.print(record.c_str());
+    stateFile.flush();
+    stateFile.close();
+    return written == record.size();
+  }
+
   bool startTrackingSession(uint32_t& trackingSessionNumber) override {
     if (!SD.cardSize()) return false;
 
     Preferences preferences;
     if (!preferences.begin("tracker", false)) return false;
     uint32_t candidate = preferences.getUInt("session", 0) + 1;
+    if (candidate <= maxStoredTrackingSessionNumber_) {
+      if (maxStoredTrackingSessionNumber_ == UINT32_MAX) {
+        preferences.end();
+        return false;
+      }
+      candidate = maxStoredTrackingSessionNumber_ + 1;
+    }
     do {
       snprintf(trackingSessionDirectory, sizeof(trackingSessionDirectory),
                "/session-%010lu", static_cast<unsigned long>(candidate));
@@ -135,6 +208,45 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     rawPointFile.flush();
     return bodyWritten == ndjson.size() && newlineWritten == 1;
   }
+
+ private:
+  static bool parseTrackingSessionNumber(const char* path,
+                                         uint32_t& trackingSessionNumber) {
+    const char* name = strrchr(path, '/');
+    name = name == nullptr ? path : name + 1;
+    unsigned long parsed = 0;
+    char trailing = '\0';
+    if (sscanf(name, "session-%lu%c", &parsed, &trailing) != 1 ||
+        parsed == 0 || parsed > UINT32_MAX) {
+      return false;
+    }
+    trackingSessionNumber = static_cast<uint32_t>(parsed);
+    return true;
+  }
+
+  static uint32_t countCompleteLines(const char* path) {
+    File file = SD.open(path, FILE_READ);
+    if (!file) return 0;
+    uint32_t completeLines = 0;
+    while (file.available()) {
+      if (file.read() == '\n' && completeLines != UINT32_MAX) ++completeLines;
+    }
+    file.close();
+    return completeLines;
+  }
+
+  static std::string readFile(const char* path) {
+    File file = SD.open(path, FILE_READ);
+    if (!file) return std::string();
+    std::string contents;
+    contents.reserve(file.size());
+    while (file.available()) contents += static_cast<char>(file.read());
+    file.close();
+    return contents;
+  }
+
+  uint32_t maxStoredTrackingSessionNumber_ = 0;
+  std::vector<tracking::RecoveredTrackingSession> recoveredSessions_;
 };
 
 Esp32TrackingStorage storage;
@@ -236,7 +348,9 @@ void setup() {
   const uint32_t serialStartedAt = millis();
   while (!Serial && millis() - serialStartedAt < 3000) delay(10);
   Serial.println("\n=== ESP32 Motorcycle Tracker ===");
-  initializeSd();
+  if (initializeSd() && !storage.recoverPersistedSessions()) {
+    logDiagnostic("[RECOVERY] SD session scan FAILED\n");
+  }
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Serial.printf("[GPS] UART RX=%d TX=%d baud=%lu\n", GPS_RX_PIN, GPS_TX_PIN,
                 static_cast<unsigned long>(GPS_BAUD));
