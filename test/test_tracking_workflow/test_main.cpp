@@ -202,6 +202,21 @@ void failed_raw_append_is_not_treated_as_recorded() {
   TEST_ASSERT_EQUAL_UINT32(1, retried.point.pointNumber);
 }
 
+void long_tracker_id_does_not_truncate_the_point_contract() {
+  const std::string trackerId(220, 'x');
+  tracking::TrackingWorkflow workflow(trackerId);
+  ScenarioStorage storage;
+
+  startTracking(workflow, storage);
+  const std::string& json = storage.lines[0];
+
+  TEST_ASSERT_NOT_EQUAL(std::string::npos,
+                        json.find("\"tracker_id\":\"" + trackerId + "\""));
+  TEST_ASSERT_NOT_EQUAL(std::string::npos,
+                        json.find("\"tracking_session_number\":41"));
+  TEST_ASSERT_EQUAL('}', json[json.size() - 1]);
+}
+
 }  // namespace
 
 int main(int, char**) {
@@ -213,5 +228,6 @@ int main(int, char**) {
   RUN_TEST(active_session_ignores_stale_and_invalid_locations);
   RUN_TEST(point_contract_preserves_values_and_uses_null_for_missing_or_nonfinite);
   RUN_TEST(failed_raw_append_is_not_treated_as_recorded);
+  RUN_TEST(long_tracker_id_does_not_truncate_the_point_contract);
   return UNITY_END();
 }

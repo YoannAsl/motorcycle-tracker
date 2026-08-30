@@ -139,16 +139,17 @@ TrackingDecision TrackingWorkflow::processFix(const GpsFix& fix,
 bool TrackingWorkflow::trackingSessionActive() const { return active_; }
 
 std::string serializeTrackPoint(const TrackPoint& point) {
-  char numbers[192];
+  char numbers[96];
+  std::snprintf(numbers, sizeof(numbers), "{\"schema_version\":%lu,",
+                static_cast<unsigned long>(point.schemaVersion));
+  std::string json(numbers);
+  json += "\"tracker_id\":\"" + escapeJson(point.trackerId) + "\",";
   std::snprintf(numbers, sizeof(numbers),
-                "{\"schema_version\":%lu,\"tracker_id\":\"%s\","
                 "\"tracking_session_number\":%lu,\"point_number\":%lu,"
                 "\"gps_utc\":",
-                static_cast<unsigned long>(point.schemaVersion),
-                escapeJson(point.trackerId).c_str(),
                 static_cast<unsigned long>(point.trackingSessionNumber),
                 static_cast<unsigned long>(point.pointNumber));
-  std::string json(numbers);
+  json += numbers;
   if (point.utcValid && !point.utc.empty()) {
     json += "\"" + escapeJson(point.utc) + "\"";
   } else {
