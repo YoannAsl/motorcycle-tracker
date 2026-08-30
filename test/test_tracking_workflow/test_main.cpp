@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "delivery_scheduler.h"
 #include "tracking_workflow.h"
 
 void setUp() {}
@@ -219,6 +220,21 @@ void long_tracker_id_does_not_truncate_the_point_contract() {
   TEST_ASSERT_EQUAL('}', json[json.size() - 1]);
 }
 
+void network_retry_state_does_not_suppress_recording_decisions() {
+  tracking::TrackingWorkflow workflow("tracker-01");
+  ScenarioStorage storage;
+  startTracking(workflow, storage);
+  tracking::DeliveryRetrySchedule retry;
+
+  TEST_ASSERT_EQUAL_UINT32(15, retry.recordFailure());
+  const tracking::TrackingDecision duringFailure =
+      workflow.processFix(movingFix(), storage);
+
+  TEST_ASSERT_TRUE(duringFailure.rawPointRecorded);
+  TEST_ASSERT_EQUAL_UINT32(2, duringFailure.point.pointNumber);
+  TEST_ASSERT_EQUAL_UINT32(2, storage.points.size());
+}
+
 }  // namespace
 
 int main(int, char**) {
@@ -231,5 +247,6 @@ int main(int, char**) {
   RUN_TEST(point_contract_preserves_values_and_uses_null_for_missing_or_nonfinite);
   RUN_TEST(failed_raw_append_is_not_treated_as_recorded);
   RUN_TEST(long_tracker_id_does_not_truncate_the_point_contract);
+  RUN_TEST(network_retry_state_does_not_suppress_recording_decisions);
   return UNITY_END();
 }

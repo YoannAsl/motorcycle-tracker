@@ -67,6 +67,21 @@ void retry_sequence_caps_at_five_minutes_and_success_resets_it() {
   TEST_ASSERT_EQUAL_UINT32(15, retry.recordFailure());
 }
 
+void reboot_keeps_recorded_unconfirmed_points_eligible() {
+  tracking::StoredTrackingSession stored;
+  stored.trackingSessionNumber = 41;
+  stored.highestRecordedPoint = 33;
+  stored.deliveryState = tracking::serializeDeliveryProgress(41, 30);
+  const std::vector<tracking::RecoveredTrackingSession> recovered =
+      tracking::recoverTrackingSessions({stored});
+  tracking::PendingDeliveryBatch batch;
+
+  TEST_ASSERT_TRUE(tracking::selectOldestPendingBatch(recovered, batch));
+  TEST_ASSERT_EQUAL_UINT32(41, batch.trackingSessionNumber);
+  TEST_ASSERT_EQUAL_UINT32(31, batch.firstPointNumber);
+  TEST_ASSERT_EQUAL_UINT32(3, batch.pointCount);
+}
+
 }  // namespace
 
 int main(int, char**) {
@@ -75,5 +90,6 @@ int main(int, char**) {
   RUN_TEST(inactive_session_exposes_its_final_partial_batch);
   RUN_TEST(oldest_eligible_pending_range_is_selected_first);
   RUN_TEST(retry_sequence_caps_at_five_minutes_and_success_resets_it);
+  RUN_TEST(reboot_keeps_recorded_unconfirmed_points_eligible);
   return UNITY_END();
 }

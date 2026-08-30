@@ -12,6 +12,7 @@
 #include <freertos/semphr.h>
 
 #include "delivery_recovery.h"
+#include "delivery_scheduler.h"
 #include "tracking_workflow.h"
 #include "upload_contract.h"
 
@@ -194,43 +195,44 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     return true;
   }
 
-  bool readFullPendingBatch(tracking::UploadBatch& batch) {
+  bool readPendingBatch(tracking::UploadBatch& batch) {
     ScopedSdLock lock;
     if (!lock) return false;
-    for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
-             recoveredSessions_.begin();
-         it != recoveredSessions_.end(); ++it) {
-      if (it->highestRecordedPoint - it->highestConfirmedPoint < 30) continue;
+    tracking::PendingDeliveryBatch pending;
+    if (!tracking::selectOldestPendingBatch(recoveredSessions_, pending)) {
+      return false;
+    }
 
-      char path[80];
-      snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
-               static_cast<unsigned long>(it->trackingSessionNumber));
-      File points = SD.open(path, FILE_READ);
-      if (!points) return false;
+    char path[80];
+    snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
+             static_cast<unsigned long>(pending.trackingSessionNumber));
+    File points = SD.open(path, FILE_READ);
+    if (!points) return false;
 
-      uint32_t pointNumber = 0;
-      batch = tracking::UploadBatch();
-      batch.trackerId = TRACKER_ID;
-      batch.trackingSessionNumber = it->trackingSessionNumber;
-      batch.firstPointNumber = it->highestConfirmedPoint + 1;
-      while (points.available() && batch.ndjsonPoints.size() < 30) {
-        String line = points.readStringUntil('\n');
-        ++pointNumber;
-        if (pointNumber < batch.firstPointNumber) continue;
-        if (line.endsWith("\r")) line.remove(line.length() - 1);
-        if (line.length() == 0) {
-          points.close();
-          return false;
-        }
-        batch.ndjsonPoints.push_back(
-            std::string(line.c_str(), static_cast<size_t>(line.length())));
+    uint32_t pointNumber = 0;
+    batch = tracking::UploadBatch();
+    batch.trackerId = TRACKER_ID;
+    batch.trackingSessionNumber = pending.trackingSessionNumber;
+    batch.firstPointNumber = pending.firstPointNumber;
+    while (points.available() &&
+           batch.ndjsonPoints.size() < pending.pointCount) {
+      String line = points.readStringUntil('\n');
+      ++pointNumber;
+      if (pointNumber < batch.firstPointNumber) continue;
+      if (line.endsWith("\r")) line.remove(line.length() - 1);
+      if (line.length() == 0) {
+        points.close();
+        return false;
       }
-      points.close();
-      if (batch.ndjsonPoints.size() == 30) return true;
+      batch.ndjsonPoints.push_back(
+          std::string(line.c_str(), static_cast<size_t>(line.length())));
+    }
+    points.close();
+    if (batch.ndjsonPoints.size() != pending.pointCount) {
       batch = tracking::UploadBatch();
       return false;
     }
-    return false;
+    return true;
   }
 
   bool startTrackingSession(uint32_t& trackingSessionNumber) override {
@@ -438,15 +440,11 @@ tracking::GpsFix currentGpsFix(uint32_t now) {
   return fix;
 }
 
-void uploadOneBatch(void*) {
-  tracking::UploadBatch batch;
-  while (!storage.readFullPendingBatch(batch)) vTaskDelay(pdMS_TO_TICKS(1000));
-
+bool uploadBatch(const tracking::UploadBatch& batch) {
   tracking::UploadRequest request;
   if (!tracking::buildUploadRequest(UPLOAD_URL, TRACKER_TOKEN, batch, request)) {
     logDiagnostic("[UPLOAD] Invalid local configuration or point range\n");
-    vTaskDelete(nullptr);
-    return;
+    return false;
   }
 
   WiFi.mode(WIFI_STA);
@@ -458,8 +456,7 @@ void uploadOneBatch(void*) {
   }
   if (WiFi.status() != WL_CONNECTED) {
     logDiagnostic("[UPLOAD] Wi-Fi connection failed; points remain pending\n");
-    vTaskDelete(nullptr);
-    return;
+    return false;
   }
 
   WiFiClientSecure tlsClient;
@@ -469,8 +466,7 @@ void uploadOneBatch(void*) {
   http.setTimeout(NETWORK_TIMEOUT_MS);
   if (!http.begin(tlsClient, request.url.c_str())) {
     logDiagnostic("[UPLOAD] HTTPS setup failed; points remain pending\n");
-    vTaskDelete(nullptr);
-    return;
+    return false;
   }
   for (std::vector<tracking::UploadRequest::Header>::const_iterator it =
            request.headers.begin();
@@ -491,8 +487,7 @@ void uploadOneBatch(void*) {
     logDiagnostic(
         "[UPLOAD] HTTPS response rejected status=%d; points remain pending\n",
         statusCode);
-    vTaskDelete(nullptr);
-    return;
+    return false;
   }
 
   const uint32_t lastPoint = batch.firstPointNumber +
@@ -502,11 +497,31 @@ void uploadOneBatch(void*) {
                   static_cast<unsigned long>(batch.trackingSessionNumber),
                   static_cast<unsigned long>(batch.firstPointNumber),
                   static_cast<unsigned long>(lastPoint));
+    return true;
   } else {
     logDiagnostic(
         "[UPLOAD] Confirmation persistence failed; points remain pending\n");
+    return false;
   }
-  vTaskDelete(nullptr);
+}
+
+void uploadPendingData(void*) {
+  tracking::DeliveryRetrySchedule retry;
+  while (true) {
+    tracking::UploadBatch batch;
+    if (!storage.readPendingBatch(batch)) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    if (uploadBatch(batch)) {
+      retry.recordSuccess();
+      continue;
+    }
+    const uint32_t retrySeconds = retry.recordFailure();
+    logDiagnostic("[UPLOAD] Retrying pending data in %lu seconds\n",
+                  static_cast<unsigned long>(retrySeconds));
+    vTaskDelay(pdMS_TO_TICKS(retrySeconds * 1000));
+  }
 }
 
 }  // namespace
@@ -521,7 +536,7 @@ void setup() {
   if (sdReady) {
     if (!storage.recoverPersistedSessions()) {
       logDiagnostic("[RECOVERY] SD session scan FAILED\n");
-    } else if (xTaskCreatePinnedToCore(uploadOneBatch, "track-upload", 8192,
+    } else if (xTaskCreatePinnedToCore(uploadPendingData, "track-upload", 8192,
                                       nullptr, 0, nullptr, 0) !=
                pdPASS) {
       logDiagnostic("[UPLOAD] Background task start failed\n");
