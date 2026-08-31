@@ -1,27 +1,32 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string>
 #include <vector>
 
 namespace tracking {
 
+class DiagnosticLogStorage {
+ public:
+  virtual ~DiagnosticLogStorage() = default;
+  virtual size_t appendDiagnosticText(const std::string& text) = 0;
+};
+
+enum class DiagnosticWriteStatus { persisted, retained, full };
+
 class DiagnosticLog {
  public:
-  void recordBoot(const std::string& resetReason);
-  void recordHealth(uint32_t uptimeMilliseconds, uint32_t rawPoints,
-                    uint32_t noFreshLocation);
-  void recordWifiState(const std::string& state);
-  void recordUploadAttempt(const std::string& kind,
-                           uint32_t trackingSessionNumber);
-  void recordUploadResult(const std::string& kind, const std::string& result);
-  void recordCleanup(const std::string& detail);
-  void recordError(const std::string& component, const std::string& detail);
-  const std::string& contents() const;
+  explicit DiagnosticLog(size_t pendingCapacity = 2048);
+  DiagnosticWriteStatus append(DiagnosticLogStorage* storage,
+                               const std::string& text);
+  DiagnosticWriteStatus flush(DiagnosticLogStorage& storage);
+  const std::string& pending() const;
 
  private:
-  void append(const char* category, const std::string& detail);
-  std::string contents_;
+  DiagnosticWriteStatus retain(const std::string& text);
+  size_t pendingCapacity_;
+  std::string pending_;
 };
 
 struct DiagnosticLogUpload {
@@ -48,11 +53,20 @@ struct DiagnosticUploadRequest {
 
 enum class DiagnosticUploadFailure {
   Wifi,
+  Connection,
   Authentication,
-  Server,
+  Http,
   Tls,
+  Transport,
   MalformedResponse,
   Timeout,
+};
+
+class DiagnosticConfirmationStorage {
+ public:
+  virtual ~DiagnosticConfirmationStorage() = default;
+  virtual bool appendText(const std::string& path,
+                          const std::string& contents) = 0;
 };
 
 bool buildDiagnosticUploadRequest(const std::string& uploadUrl,
@@ -63,11 +77,17 @@ bool validateDiagnosticUploadResponse(int statusCode,
                                       const std::string& responseBody,
                                       const DiagnosticLogUpload& upload);
 std::string diagnosticUploadFailureMessage(DiagnosticUploadFailure failure);
+DiagnosticUploadFailure classifyHttpFailure(int statusCode,
+                                            bool tlsFailure = false);
 std::string serializeDiagnosticDelivery(const std::string& trackerId,
                                         uint32_t trackingSessionNumber);
 bool selectOldestPendingDiagnosticLog(
     const std::string& trackerId,
     const std::vector<StoredDiagnosticLog>& storedLogs,
     DiagnosticLogUpload& pending);
+bool confirmDiagnosticDelivery(DiagnosticConfirmationStorage& storage,
+                               const std::string& trackerId,
+                               uint32_t trackingSessionNumber,
+                               std::vector<StoredDiagnosticLog>& storedLogs);
 
 }  // namespace tracking
