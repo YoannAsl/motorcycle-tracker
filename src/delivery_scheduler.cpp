@@ -41,4 +41,19 @@ uint32_t DeliveryRetrySchedule::recordFailure() {
 
 void DeliveryRetrySchedule::recordSuccess() { consecutiveFailures_ = 0; }
 
+bool DeliveryRetrySchedule::ready(uint32_t nowMilliseconds) const {
+  return static_cast<int32_t>(nowMilliseconds - nextAttemptAtMilliseconds_) >= 0;
+}
+
+uint32_t DeliveryRetrySchedule::scheduleFailure(uint32_t nowMilliseconds) {
+  const uint32_t delaySeconds = recordFailure();
+  nextAttemptAtMilliseconds_ = nowMilliseconds + delaySeconds * 1000;
+  return delaySeconds;
+}
+
+void DeliveryRetrySchedule::scheduleSuccess(uint32_t nowMilliseconds) {
+  recordSuccess();
+  nextAttemptAtMilliseconds_ = nowMilliseconds;
+}
+
 }  // namespace tracking
