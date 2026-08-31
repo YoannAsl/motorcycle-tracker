@@ -135,6 +135,27 @@ void only_matching_complete_success_confirms_delivery() {
       batch, confirmation));
 }
 
+void confirmation_rejects_noncanonical_or_overflowing_integers() {
+  const tracking::UploadBatch batch = thirtyPoints();
+  tracking::UploadConfirmation confirmation;
+
+  TEST_ASSERT_FALSE(tracking::validateUploadResponse(
+      200,
+      "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":041,"
+      "\"highest_stored_point_number\":30}",
+      batch, confirmation));
+  TEST_ASSERT_FALSE(tracking::validateUploadResponse(
+      200,
+      "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":41,"
+      "\"highest_stored_point_number\":0000000030}",
+      batch, confirmation));
+  TEST_ASSERT_FALSE(tracking::validateUploadResponse(
+      200,
+      "{\"tracker_id\":\"tracker-01\",\"tracking_session_number\":41,"
+      "\"highest_stored_point_number\":999999999999999999999999999999}",
+      batch, confirmation));
+}
+
 void repeated_confirmation_is_still_a_valid_success() {
   tracking::UploadBatch batch = thirtyPoints();
   tracking::UploadConfirmation confirmation;
@@ -156,6 +177,7 @@ int main(int, char**) {
   RUN_TEST(request_carries_authentication_content_type_identity_and_range);
   RUN_TEST(request_rejects_insecure_wrong_path_oversized_and_unordered_batches);
   RUN_TEST(only_matching_complete_success_confirms_delivery);
+  RUN_TEST(confirmation_rejects_noncanonical_or_overflowing_integers);
   RUN_TEST(repeated_confirmation_is_still_a_valid_success);
   return UNITY_END();
 }
