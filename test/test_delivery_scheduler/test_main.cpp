@@ -67,6 +67,26 @@ void retry_sequence_caps_at_five_minutes_and_success_resets_it() {
   TEST_ASSERT_EQUAL_UINT32(15, retry.recordFailure());
 }
 
+void point_and_diagnostic_retry_windows_advance_independently() {
+  tracking::DeliveryRetrySchedule points;
+  tracking::DeliveryRetrySchedule diagnostics;
+
+  TEST_ASSERT_EQUAL_UINT32(15, points.scheduleFailure(1000));
+  TEST_ASSERT_TRUE(diagnostics.ready(2000));
+  TEST_ASSERT_FALSE(points.ready(2000));
+
+  TEST_ASSERT_EQUAL_UINT32(15, diagnostics.scheduleFailure(2000));
+  TEST_ASSERT_TRUE(points.ready(16000));
+  TEST_ASSERT_FALSE(diagnostics.ready(16000));
+  TEST_ASSERT_TRUE(diagnostics.ready(17000));
+
+  TEST_ASSERT_EQUAL_UINT32(30, points.scheduleFailure(16000));
+  diagnostics.scheduleSuccess(17000);
+  TEST_ASSERT_TRUE(diagnostics.ready(17000));
+  TEST_ASSERT_FALSE(points.ready(45000));
+  TEST_ASSERT_TRUE(points.ready(46000));
+}
+
 void reboot_keeps_recorded_unconfirmed_points_eligible() {
   tracking::StoredTrackingSession stored;
   stored.trackingSessionNumber = 41;
@@ -90,6 +110,7 @@ int main(int, char**) {
   RUN_TEST(inactive_session_exposes_its_final_partial_batch);
   RUN_TEST(oldest_eligible_pending_range_is_selected_first);
   RUN_TEST(retry_sequence_caps_at_five_minutes_and_success_resets_it);
+  RUN_TEST(point_and_diagnostic_retry_windows_advance_independently);
   RUN_TEST(reboot_keeps_recorded_unconfirmed_points_eligible);
   return UNITY_END();
 }
