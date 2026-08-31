@@ -14,7 +14,7 @@ std::string point(uint32_t number, const char* trackerId = "tracker-01",
                   uint32_t session = 41) {
   char body[192];
   snprintf(body, sizeof(body),
-           "{\"schema_version\":1,\"tracker_id\":\"%s\"," 
+           "{\"schema_version\":1,\"tracker_id\":\"%s\","
            "\"tracking_session_number\":%lu,\"point_number\":%lu}",
            trackerId, static_cast<unsigned long>(session),
            static_cast<unsigned long>(number));
