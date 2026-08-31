@@ -53,10 +53,18 @@ bool parseUInt(const std::string& input, size_t& position, uint32_t& value) {
       !std::isdigit(static_cast<unsigned char>(input[position]))) {
     return false;
   }
+  if (input[position] == '0' && position + 1 < input.size() &&
+      std::isdigit(static_cast<unsigned char>(input[position + 1]))) {
+    return false;
+  }
   uint64_t parsed = 0;
   do {
-    parsed = parsed * 10 + static_cast<unsigned>(input[position] - '0');
-    if (parsed > std::numeric_limits<uint32_t>::max()) return false;
+    const unsigned digit = static_cast<unsigned>(input[position] - '0');
+    if (parsed >
+        (std::numeric_limits<uint32_t>::max() - digit) / 10u) {
+      return false;
+    }
+    parsed = parsed * 10 + digit;
     ++position;
   } while (position < input.size() &&
            std::isdigit(static_cast<unsigned char>(input[position])));
@@ -181,29 +189,27 @@ bool parseConfirmation(const std::string& input, std::string& trackerId,
   return position == input.size() && hasTracker && hasSession && hasHighest;
 }
 
-bool findStringField(const std::string& json, const char* field,
-                     std::string& value) {
+bool findFieldValue(const std::string& json, const char* field,
+                    size_t& position) {
   const std::string needle = std::string("\"") + field + "\":";
-  size_t position = json.find(needle);
+  position = json.find(needle);
   if (position == std::string::npos) return false;
   position += needle.size();
+  return true;
+}
+
+bool findStringField(const std::string& json, const char* field,
+                     std::string& value) {
+  size_t position = 0;
+  if (!findFieldValue(json, field, position)) return false;
   return parseString(json, position, value);
 }
 
 bool findUIntField(const std::string& json, const char* field,
                    uint32_t& value) {
-  const std::string needle = std::string("\"") + field + "\":";
-  size_t position = json.find(needle);
-  if (position == std::string::npos) return false;
-  position += needle.size();
+  size_t position = 0;
+  if (!findFieldValue(json, field, position)) return false;
   return parseUInt(json, position, value);
-}
-
-std::string number(uint32_t value) {
-  char buffer[16];
-  std::snprintf(buffer, sizeof(buffer), "%lu",
-                static_cast<unsigned long>(value));
-  return buffer;
 }
 
 bool hasRequiredUrl(const std::string& url) {
@@ -213,6 +219,13 @@ bool hasRequiredUrl(const std::string& url) {
 }
 
 }  // namespace
+
+std::string formatUInt32(uint32_t value) {
+  char buffer[16];
+  std::snprintf(buffer, sizeof(buffer), "%lu",
+                static_cast<unsigned long>(value));
+  return buffer;
+}
 
 bool buildUploadRequest(const std::string& uploadUrl,
                         const std::string& bearerToken,
@@ -255,13 +268,13 @@ bool buildUploadRequest(const std::string& uploadUrl,
   request.headers.push_back({"Authorization", "Bearer " + bearerToken});
   request.headers.push_back({"Content-Type", "application/x-ndjson"});
   request.headers.push_back(
-      {"X-Track-Point-Schema-Version", number(batch.schemaVersion)});
+      {"X-Track-Point-Schema-Version", formatUInt32(batch.schemaVersion)});
   request.headers.push_back({"X-Tracker-ID", batch.trackerId});
   request.headers.push_back(
-      {"X-Tracking-Session-Number", number(batch.trackingSessionNumber)});
+      {"X-Tracking-Session-Number", formatUInt32(batch.trackingSessionNumber)});
   request.headers.push_back(
-      {"X-First-Point-Number", number(batch.firstPointNumber)});
-  request.headers.push_back({"X-Last-Point-Number", number(lastPoint)});
+      {"X-First-Point-Number", formatUInt32(batch.firstPointNumber)});
+  request.headers.push_back({"X-Last-Point-Number", formatUInt32(lastPoint)});
   request.body = body;
   return true;
 }

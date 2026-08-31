@@ -4,15 +4,10 @@
 #include <cstdio>
 #include <limits>
 
+#include "upload_contract.h"
+
 namespace tracking {
 namespace {
-
-std::string number(uint32_t value) {
-  char buffer[16];
-  std::snprintf(buffer, sizeof(buffer), "%lu",
-                static_cast<unsigned long>(value));
-  return buffer;
-}
 
 bool hasDiagnosticUrl(const std::string& url) {
   if (url.compare(0, 8, "https://") != 0) return false;
@@ -50,13 +45,21 @@ bool parseUInt(const std::string& input, size_t& position, uint32_t& value) {
       !std::isdigit(static_cast<unsigned char>(input[position]))) {
     return false;
   }
-  uint64_t parsed = 0;
+  if (input[position] == '0' && position + 1 < input.size() &&
+      std::isdigit(static_cast<unsigned char>(input[position + 1]))) {
+    return false;
+  }
+  uint32_t parsed = 0;
   do {
-    parsed = parsed * 10 + static_cast<unsigned>(input[position++] - '0');
-    if (parsed > std::numeric_limits<uint32_t>::max()) return false;
+    const uint32_t digit = static_cast<uint32_t>(input[position] - '0');
+    if (parsed > (std::numeric_limits<uint32_t>::max() - digit) / 10u) {
+      return false;
+    }
+    parsed = parsed * 10 + digit;
+    ++position;
   } while (position < input.size() &&
            std::isdigit(static_cast<unsigned char>(input[position])));
-  value = static_cast<uint32_t>(parsed);
+  value = parsed;
   return true;
 }
 
@@ -115,50 +118,38 @@ bool parseDiagnosticConfirmation(const std::string& input,
 
 }  // namespace
 
-void DiagnosticLog::append(const char* category, const std::string& detail) {
-  contents_ += '[';
-  contents_ += category;
-  contents_ += "] ";
-  contents_ += detail;
-  contents_ += '\n';
+DiagnosticLog::DiagnosticLog(size_t pendingCapacity)
+    : pendingCapacity_(pendingCapacity) {}
+
+DiagnosticWriteStatus DiagnosticLog::retain(const std::string& text) {
+  const size_t available = pendingCapacity_ - pending_.size();
+  pending_.append(text, 0, available);
+  return text.size() <= available ? DiagnosticWriteStatus::retained
+                                  : DiagnosticWriteStatus::full;
 }
 
-void DiagnosticLog::recordBoot(const std::string& resetReason) {
-  append("BOOT", "reset=" + resetReason);
+DiagnosticWriteStatus DiagnosticLog::flush(DiagnosticLogStorage& storage) {
+  if (pending_.empty()) return DiagnosticWriteStatus::persisted;
+  const size_t written = storage.appendDiagnosticText(pending_);
+  if (written >= pending_.size()) {
+    pending_.clear();
+    return DiagnosticWriteStatus::persisted;
+  }
+  pending_.erase(0, written);
+  return DiagnosticWriteStatus::retained;
 }
 
-void DiagnosticLog::recordHealth(uint32_t uptimeMilliseconds,
-                                 uint32_t rawPoints,
-                                 uint32_t noFreshLocation) {
-  append("HEALTH", "uptime_ms=" + number(uptimeMilliseconds) +
-                       " raw_points=" + number(rawPoints) +
-                       " no_fresh_location=" + number(noFreshLocation));
+DiagnosticWriteStatus DiagnosticLog::append(DiagnosticLogStorage* storage,
+                                            const std::string& text) {
+  if (storage != nullptr && flush(*storage) == DiagnosticWriteStatus::persisted) {
+    const size_t written = storage->appendDiagnosticText(text);
+    if (written >= text.size()) return DiagnosticWriteStatus::persisted;
+    return retain(text.substr(written));
+  }
+  return retain(text);
 }
 
-void DiagnosticLog::recordWifiState(const std::string& state) {
-  append("WIFI", state);
-}
-
-void DiagnosticLog::recordUploadAttempt(const std::string& kind,
-                                        uint32_t trackingSessionNumber) {
-  append("UPLOAD", kind + " attempt session=" + number(trackingSessionNumber));
-}
-
-void DiagnosticLog::recordUploadResult(const std::string& kind,
-                                       const std::string& result) {
-  append("UPLOAD", kind + " result=" + result);
-}
-
-void DiagnosticLog::recordCleanup(const std::string& detail) {
-  append("CLEANUP", detail);
-}
-
-void DiagnosticLog::recordError(const std::string& component,
-                                const std::string& detail) {
-  append("ERROR", component + " " + detail);
-}
-
-const std::string& DiagnosticLog::contents() const { return contents_; }
+const std::string& DiagnosticLog::pending() const { return pending_; }
 
 bool buildDiagnosticUploadRequest(const std::string& uploadUrl,
                                   const std::string& bearerToken,
@@ -169,7 +160,7 @@ bool buildDiagnosticUploadRequest(const std::string& uploadUrl,
       upload.contents.empty()) {
     return false;
   }
-  const std::string session = number(upload.trackingSessionNumber);
+  const std::string session = formatUInt32(upload.trackingSessionNumber);
   request.url = uploadUrl;
   request.headers.clear();
   request.headers.push_back({"Authorization", "Bearer " + bearerToken});
@@ -198,12 +189,16 @@ std::string diagnosticUploadFailureMessage(DiagnosticUploadFailure failure) {
   switch (failure) {
     case DiagnosticUploadFailure::Wifi:
       return "Wi-Fi connection failed";
+    case DiagnosticUploadFailure::Connection:
+      return "DNS or connection failed";
     case DiagnosticUploadFailure::Authentication:
       return "authentication rejected";
-    case DiagnosticUploadFailure::Server:
-      return "server rejected the request";
+    case DiagnosticUploadFailure::Http:
+      return "HTTP request rejected";
     case DiagnosticUploadFailure::Tls:
       return "TLS setup or certificate validation failed";
+    case DiagnosticUploadFailure::Transport:
+      return "HTTP transport failed";
     case DiagnosticUploadFailure::MalformedResponse:
       return "malformed or mismatched confirmation";
     case DiagnosticUploadFailure::Timeout:
@@ -212,10 +207,29 @@ std::string diagnosticUploadFailureMessage(DiagnosticUploadFailure failure) {
   return "unknown failure";
 }
 
+DiagnosticUploadFailure classifyHttpFailure(int statusCode, bool tlsFailure) {
+  if (statusCode < 0 && tlsFailure) return DiagnosticUploadFailure::Tls;
+  if (statusCode == 401 || statusCode == 403) {
+    return DiagnosticUploadFailure::Authentication;
+  }
+  if (statusCode >= 400 && statusCode < 600) {
+    return DiagnosticUploadFailure::Http;
+  }
+  if (statusCode == -11 || statusCode == -12) {
+    return DiagnosticUploadFailure::Timeout;
+  }
+  if (statusCode == -1 || statusCode == -4 || statusCode == -5 ||
+      statusCode == -7) {
+    return DiagnosticUploadFailure::Connection;
+  }
+  if (statusCode < 0) return DiagnosticUploadFailure::Transport;
+  return DiagnosticUploadFailure::MalformedResponse;
+}
+
 std::string serializeDiagnosticDelivery(const std::string& trackerId,
                                         uint32_t trackingSessionNumber) {
   return "v1 tracker=" + trackerId + " session=" +
-         number(trackingSessionNumber) + " delivered\n";
+         formatUInt32(trackingSessionNumber) + " delivered\n";
 }
 
 bool selectOldestPendingDiagnosticLog(
@@ -240,6 +254,26 @@ bool selectOldestPendingDiagnosticLog(
   pending.trackingSessionNumber = oldest->trackingSessionNumber;
   pending.contents = oldest->contents;
   return true;
+}
+
+bool confirmDiagnosticDelivery(DiagnosticConfirmationStorage& storage,
+                               const std::string& trackerId,
+                               uint32_t trackingSessionNumber,
+                               std::vector<StoredDiagnosticLog>& storedLogs) {
+  for (std::vector<StoredDiagnosticLog>::iterator log = storedLogs.begin();
+       log != storedLogs.end(); ++log) {
+    if (log->trackingSessionNumber != trackingSessionNumber) continue;
+    const std::string record =
+        serializeDiagnosticDelivery(trackerId, trackingSessionNumber);
+    char path[96];
+    std::snprintf(path, sizeof(path),
+                  "/session-%010lu/diagnostic-delivery-state.log",
+                  static_cast<unsigned long>(trackingSessionNumber));
+    if (!storage.appendText(path, record)) return false;
+    log->deliveryState += record;
+    return true;
+  }
+  return false;
 }
 
 }  // namespace tracking

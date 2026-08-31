@@ -28,6 +28,8 @@ struct UploadConfirmation {
   uint32_t highestStoredPointNumber = 0;
 };
 
+std::string formatUInt32(uint32_t value);
+
 bool buildUploadRequest(const std::string& uploadUrl,
                         const std::string& bearerToken,
                         const UploadBatch& batch, UploadRequest& request);
