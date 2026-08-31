@@ -21,9 +21,13 @@ class DeliveryRetrySchedule {
  public:
   uint32_t recordFailure();
   void recordSuccess();
+  bool ready(uint32_t nowMilliseconds) const;
+  uint32_t scheduleFailure(uint32_t nowMilliseconds);
+  void scheduleSuccess(uint32_t nowMilliseconds);
 
  private:
   uint32_t consecutiveFailures_ = 0;
+  uint32_t nextAttemptAtMilliseconds_ = 0;
 };
 
 }  // namespace tracking
