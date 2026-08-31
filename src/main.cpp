@@ -14,6 +14,7 @@
 #include "delivery_recovery.h"
 #include "tracking_workflow.h"
 #include "upload_contract.h"
+#include "upload_queue.h"
 
 #if __has_include("tracker_config.h")
 #include "tracker_config.h"
@@ -33,6 +34,7 @@ const int SD_MISO_PIN = 19;
 const int SD_MOSI_PIN = 23;
 const uint32_t LOG_INTERVAL_MS = 1000;
 const uint32_t NETWORK_TIMEOUT_MS = 15000;
+const uint32_t UPLOAD_RETRY_MS = 5000;
 
 const char GPX_HEADER[] =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -75,6 +77,7 @@ void logDiagnostic(const char* format, ...) {
   va_end(arguments);
   Serial.print(buffer);
   ScopedSdLock lock;
+  if (!lock) return;
   if (diagnosticFile) {
     diagnosticFile.print(buffer);
     diagnosticFile.flush();
@@ -112,141 +115,144 @@ bool writeInitialExports() {
   return true;
 }
 
-class Esp32TrackingStorage : public tracking::TrackingStorage {
+tracking::DeliveryRecovery deliveryRecovery;
+
+class Esp32TrackingStorage : public tracking::TrackingStorage,
+                              public tracking::DeliveryRecoveryStorage,
+                              public tracking::UploadPointSource {
  public:
-  bool recoverPersistedSessions() {
+  bool listRoot(
+      std::vector<tracking::RecoveryDirectoryEntry>& entries) override {
     ScopedSdLock lock;
     if (!lock) return false;
-    std::vector<tracking::StoredTrackingSession> storedSessions;
     File root = SD.open("/");
     if (!root || !root.isDirectory()) return false;
 
-    maxStoredTrackingSessionNumber_ = 0;
     File entry = root.openNextFile();
     while (entry) {
-      uint32_t trackingSessionNumber = 0;
-      if (entry.isDirectory() &&
-          parseTrackingSessionNumber(entry.name(), trackingSessionNumber)) {
-        if (trackingSessionNumber > maxStoredTrackingSessionNumber_) {
-          maxStoredTrackingSessionNumber_ = trackingSessionNumber;
-        }
-
-        tracking::StoredTrackingSession stored;
-        stored.trackingSessionNumber = trackingSessionNumber;
-        char path[80];
-        snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
-                 static_cast<unsigned long>(trackingSessionNumber));
-        stored.highestRecordedPoint = countCompleteLines(path);
-        snprintf(path, sizeof(path), "/session-%010lu/delivery-state.log",
-                 static_cast<unsigned long>(trackingSessionNumber));
-        stored.deliveryState = readFile(path);
-        storedSessions.push_back(stored);
-      }
+      tracking::RecoveryDirectoryEntry recoveredEntry;
+      recoveredEntry.name = entry.name();
+      recoveredEntry.directory = entry.isDirectory();
+      entries.push_back(recoveredEntry);
       entry.close();
       entry = root.openNextFile();
     }
     root.close();
-
-    recoveredSessions_ = tracking::recoverTrackingSessions(storedSessions);
-    for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
-             recoveredSessions_.begin();
-         it != recoveredSessions_.end(); ++it) {
-      logDiagnostic(
-          "[RECOVERY] session=%lu recorded=%lu confirmed=%lu status=%s\n",
-          static_cast<unsigned long>(it->trackingSessionNumber),
-          static_cast<unsigned long>(it->highestRecordedPoint),
-          static_cast<unsigned long>(it->highestConfirmedPoint),
-          it->recoveryRequired ? "safe-resend" : "clean");
-    }
     return true;
   }
 
-  const std::vector<tracking::RecoveredTrackingSession>& recoveredSessions()
-      const {
-    return recoveredSessions_;
+  tracking::RecoveryReadStatus countCompleteLines(
+      const std::string& path, uint32_t& completeLines) override {
+    ScopedSdLock lock;
+    if (!lock) return tracking::RecoveryReadStatus::unreadable;
+    if (!SD.exists(path.c_str())) return tracking::RecoveryReadStatus::missing;
+    File file = SD.open(path.c_str(), FILE_READ);
+    if (!file) return tracking::RecoveryReadStatus::unreadable;
+    completeLines = 0;
+    const size_t expectedBytes = file.size();
+    size_t bytesRead = 0;
+    while (file.available()) {
+      const int value = file.read();
+      if (value < 0) break;
+      ++bytesRead;
+      if (value == '\n' && completeLines != UINT32_MAX) ++completeLines;
+    }
+    file.close();
+    return bytesRead == expectedBytes ? tracking::RecoveryReadStatus::readable
+                                      : tracking::RecoveryReadStatus::unreadable;
+  }
+
+  tracking::RecoveryReadStatus readText(const std::string& path,
+                                        std::string& contents) override {
+    ScopedSdLock lock;
+    if (!lock) return tracking::RecoveryReadStatus::unreadable;
+    if (!SD.exists(path.c_str())) return tracking::RecoveryReadStatus::missing;
+    File file = SD.open(path.c_str(), FILE_READ);
+    if (!file) return tracking::RecoveryReadStatus::unreadable;
+    const size_t expectedBytes = file.size();
+    contents.clear();
+    contents.reserve(expectedBytes);
+    while (file.available()) {
+      const int value = file.read();
+      if (value < 0) break;
+      contents += static_cast<char>(value);
+    }
+    file.close();
+    return contents.size() == expectedBytes
+               ? tracking::RecoveryReadStatus::readable
+               : tracking::RecoveryReadStatus::unreadable;
+  }
+
+  bool appendText(const std::string& path,
+                   const std::string& contents) override {
+    ScopedSdLock lock;
+    if (!lock) return false;
+    File stateFile = SD.open(path.c_str(), FILE_APPEND);
+    if (!stateFile) return false;
+    const size_t written = stateFile.print(contents.c_str());
+    stateFile.flush();
+    stateFile.close();
+    return written == contents.size();
+  }
+
+  tracking::BatchReadStatus readPointLines(
+      uint32_t trackingSessionNumber, uint32_t firstPointNumber,
+      size_t pointCount, std::vector<std::string>& lines) override {
+    ScopedSdLock lock;
+    if (!lock) return tracking::BatchReadStatus::lock_unavailable;
+    char path[80];
+    snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
+             static_cast<unsigned long>(trackingSessionNumber));
+    File points = SD.open(path, FILE_READ);
+    if (!points) return tracking::BatchReadStatus::storage_open_failed;
+
+    uint32_t pointNumber = 0;
+    lines.clear();
+    while (points.available() && lines.size() < pointCount) {
+      String line = points.readStringUntil('\n');
+      ++pointNumber;
+      if (pointNumber < firstPointNumber) continue;
+      if (line.endsWith("\r")) line.remove(line.length() - 1);
+      if (line.length() == 0) {
+        points.close();
+        return tracking::BatchReadStatus::malformed_input;
+      }
+      lines.push_back(
+          std::string(line.c_str(), static_cast<size_t>(line.length())));
+    }
+    points.close();
+    return lines.size() == pointCount ? tracking::BatchReadStatus::ready
+                                     : tracking::BatchReadStatus::malformed_input;
+  }
+
+  tracking::BatchReadStatus readFullPendingBatch(tracking::UploadBatch& batch) {
+    ScopedSdLock lock;
+    if (!lock) return tracking::BatchReadStatus::lock_unavailable;
+    return tracking::readFullPendingBatch(deliveryRecovery.sessions(), *this,
+                                          TRACKER_ID, batch);
   }
 
   bool confirmDeliveryThrough(uint32_t trackingSessionNumber,
                               uint32_t highestConfirmedPoint) {
     ScopedSdLock lock;
     if (!lock) return false;
-    char path[80];
-    snprintf(path, sizeof(path), "/session-%010lu/delivery-state.log",
-             static_cast<unsigned long>(trackingSessionNumber));
-    File stateFile = SD.open(path, FILE_APPEND);
-    if (!stateFile) return false;
-    const std::string record = tracking::serializeDeliveryProgress(
-        trackingSessionNumber, highestConfirmedPoint);
-    const size_t written = stateFile.print(record.c_str());
-    stateFile.flush();
-    stateFile.close();
-    if (written != record.size()) return false;
-    for (std::vector<tracking::RecoveredTrackingSession>::iterator it =
-             recoveredSessions_.begin();
-         it != recoveredSessions_.end(); ++it) {
-      if (it->trackingSessionNumber == trackingSessionNumber &&
-          highestConfirmedPoint > it->highestConfirmedPoint &&
-          highestConfirmedPoint <= it->highestRecordedPoint) {
-        it->highestConfirmedPoint = highestConfirmedPoint;
-        break;
-      }
-    }
-    return true;
-  }
-
-  bool readFullPendingBatch(tracking::UploadBatch& batch) {
-    ScopedSdLock lock;
-    if (!lock) return false;
-    for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
-             recoveredSessions_.begin();
-         it != recoveredSessions_.end(); ++it) {
-      if (it->highestRecordedPoint - it->highestConfirmedPoint < 30) continue;
-
-      char path[80];
-      snprintf(path, sizeof(path), "/session-%010lu/track-points.ndjson",
-               static_cast<unsigned long>(it->trackingSessionNumber));
-      File points = SD.open(path, FILE_READ);
-      if (!points) return false;
-
-      uint32_t pointNumber = 0;
-      batch = tracking::UploadBatch();
-      batch.trackerId = TRACKER_ID;
-      batch.trackingSessionNumber = it->trackingSessionNumber;
-      batch.firstPointNumber = it->highestConfirmedPoint + 1;
-      while (points.available() && batch.ndjsonPoints.size() < 30) {
-        String line = points.readStringUntil('\n');
-        ++pointNumber;
-        if (pointNumber < batch.firstPointNumber) continue;
-        if (line.endsWith("\r")) line.remove(line.length() - 1);
-        if (line.length() == 0) {
-          points.close();
-          return false;
-        }
-        batch.ndjsonPoints.push_back(
-            std::string(line.c_str(), static_cast<size_t>(line.length())));
-      }
-      points.close();
-      if (batch.ndjsonPoints.size() == 30) return true;
-      batch = tracking::UploadBatch();
-      return false;
-    }
-    return false;
+    return deliveryRecovery.confirmDeliveryThrough(
+        *this, trackingSessionNumber, highestConfirmedPoint);
   }
 
   bool startTrackingSession(uint32_t& trackingSessionNumber) override {
     ScopedSdLock lock;
     if (!lock) return false;
-    if (!SD.cardSize()) return false;
+    if (!deliveryRecovery.ready() || !SD.cardSize()) return false;
 
     Preferences preferences;
     if (!preferences.begin("tracker", false)) return false;
-    uint32_t candidate = preferences.getUInt("session", 0) + 1;
-    if (candidate <= maxStoredTrackingSessionNumber_) {
-      if (maxStoredTrackingSessionNumber_ == UINT32_MAX) {
-        preferences.end();
-        return false;
-      }
-      candidate = maxStoredTrackingSessionNumber_ + 1;
+    uint32_t candidate = 0;
+    if (!tracking::nextTrackingSessionNumber(
+            preferences.getUInt("session", 0),
+            deliveryRecovery.maxStoredTrackingSessionNumber(), candidate)) {
+      preferences.end();
+      return false;
     }
     do {
       snprintf(trackingSessionDirectory, sizeof(trackingSessionDirectory),
@@ -276,17 +282,14 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     if (!diagnosticFile) return false;
 
     trackingSessionNumber = candidate;
-    tracking::RecoveredTrackingSession activeSession;
-    activeSession.trackingSessionNumber = candidate;
-    activeSession.inactive = false;
-    recoveredSessions_.push_back(activeSession);
+    if (!deliveryRecovery.beginSession(candidate)) return false;
     logDiagnostic("[SESSION] Started number=%lu directory=%s\n",
                   static_cast<unsigned long>(candidate),
                   trackingSessionDirectory);
     return true;
   }
 
-  bool appendAndFlushRawPoint(const tracking::TrackPoint&,
+  bool appendAndFlushRawPoint(const tracking::TrackPoint& point,
                               const std::string& ndjson) override {
     ScopedSdLock lock;
     if (!lock) return false;
@@ -294,52 +297,10 @@ class Esp32TrackingStorage : public tracking::TrackingStorage {
     const size_t bodyWritten = rawPointFile.print(ndjson.c_str());
     const size_t newlineWritten = rawPointFile.print('\n');
     rawPointFile.flush();
-    if (bodyWritten != ndjson.size() || newlineWritten != 1) return false;
-    if (!recoveredSessions_.empty() && !recoveredSessions_.back().inactive &&
-        recoveredSessions_.back().highestRecordedPoint != UINT32_MAX) {
-      ++recoveredSessions_.back().highestRecordedPoint;
-    }
-    return true;
+    return bodyWritten == ndjson.size() && newlineWritten == 1 &&
+           deliveryRecovery.recordPoint(point.trackingSessionNumber);
   }
 
- private:
-  static bool parseTrackingSessionNumber(const char* path,
-                                         uint32_t& trackingSessionNumber) {
-    const char* name = strrchr(path, '/');
-    name = name == nullptr ? path : name + 1;
-    unsigned long parsed = 0;
-    char trailing = '\0';
-    if (sscanf(name, "session-%lu%c", &parsed, &trailing) != 1 ||
-        parsed == 0 || parsed > UINT32_MAX) {
-      return false;
-    }
-    trackingSessionNumber = static_cast<uint32_t>(parsed);
-    return true;
-  }
-
-  static uint32_t countCompleteLines(const char* path) {
-    File file = SD.open(path, FILE_READ);
-    if (!file) return 0;
-    uint32_t completeLines = 0;
-    while (file.available()) {
-      if (file.read() == '\n' && completeLines != UINT32_MAX) ++completeLines;
-    }
-    file.close();
-    return completeLines;
-  }
-
-  static std::string readFile(const char* path) {
-    File file = SD.open(path, FILE_READ);
-    if (!file) return std::string();
-    std::string contents;
-    contents.reserve(file.size());
-    while (file.available()) contents += static_cast<char>(file.read());
-    file.close();
-    return contents;
-  }
-
-  uint32_t maxStoredTrackingSessionNumber_ = 0;
-  std::vector<tracking::RecoveredTrackingSession> recoveredSessions_;
 };
 
 Esp32TrackingStorage storage;
@@ -439,74 +400,92 @@ tracking::GpsFix currentGpsFix(uint32_t now) {
 }
 
 void uploadOneBatch(void*) {
-  tracking::UploadBatch batch;
-  while (!storage.readFullPendingBatch(batch)) vTaskDelay(pdMS_TO_TICKS(1000));
+  for (;;) {
+    tracking::UploadBatch batch;
+    const tracking::BatchReadStatus batchStatus =
+        storage.readFullPendingBatch(batch);
+    if (batchStatus == tracking::BatchReadStatus::no_full_batch) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+    if (batchStatus != tracking::BatchReadStatus::ready) {
+      const char* failure = "malformed point data";
+      if (batchStatus == tracking::BatchReadStatus::lock_unavailable) {
+        failure = "SD lock unavailable";
+      } else if (batchStatus ==
+                 tracking::BatchReadStatus::storage_open_failed) {
+        failure = "point file open failed";
+      }
+      logDiagnostic("[UPLOAD] Batch read failed: %s; retrying\n", failure);
+      vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_MS));
+      continue;
+    }
 
-  tracking::UploadRequest request;
-  if (!tracking::buildUploadRequest(UPLOAD_URL, TRACKER_TOKEN, batch, request)) {
-    logDiagnostic("[UPLOAD] Invalid local configuration or point range\n");
-    vTaskDelete(nullptr);
-    return;
-  }
+    tracking::UploadRequest request;
+    if (!tracking::buildUploadRequest(UPLOAD_URL, TRACKER_TOKEN, batch,
+                                      request)) {
+      logDiagnostic("[UPLOAD] Invalid local configuration or point range\n");
+      vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_MS));
+      continue;
+    }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(HOTSPOT_NAME, HOTSPOT_PASSWORD);
-  const uint32_t connectionStartedAt = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - connectionStartedAt < NETWORK_TIMEOUT_MS) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    logDiagnostic("[UPLOAD] Wi-Fi connection failed; points remain pending\n");
-    vTaskDelete(nullptr);
-    return;
-  }
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(HOTSPOT_NAME, HOTSPOT_PASSWORD);
+    const uint32_t connectionStartedAt = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - connectionStartedAt < NETWORK_TIMEOUT_MS) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      logDiagnostic("[UPLOAD] Wi-Fi connection failed; retrying\n");
+      vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_MS));
+      continue;
+    }
 
-  WiFiClientSecure tlsClient;
-  tlsClient.setCACert(UPLOAD_ROOT_CA_CERTIFICATE);
-  tlsClient.setTimeout(NETWORK_TIMEOUT_MS);
-  HTTPClient http;
-  http.setTimeout(NETWORK_TIMEOUT_MS);
-  if (!http.begin(tlsClient, request.url.c_str())) {
-    logDiagnostic("[UPLOAD] HTTPS setup failed; points remain pending\n");
-    vTaskDelete(nullptr);
-    return;
-  }
-  for (std::vector<tracking::UploadRequest::Header>::const_iterator it =
-           request.headers.begin();
-       it != request.headers.end(); ++it) {
-    http.addHeader(it->name.c_str(), it->value.c_str());
-  }
+    WiFiClientSecure tlsClient;
+    tlsClient.setCACert(UPLOAD_ROOT_CA_CERTIFICATE);
+    tlsClient.setTimeout(NETWORK_TIMEOUT_MS);
+    HTTPClient http;
+    http.setTimeout(NETWORK_TIMEOUT_MS);
+    if (!http.begin(tlsClient, request.url.c_str())) {
+      logDiagnostic("[UPLOAD] HTTPS setup failed; retrying\n");
+      vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_MS));
+      continue;
+    }
+    for (std::vector<tracking::UploadRequest::Header>::const_iterator it =
+             request.headers.begin();
+         it != request.headers.end(); ++it) {
+      http.addHeader(it->name.c_str(), it->value.c_str());
+    }
 
-  const int statusCode = http.POST(
-      reinterpret_cast<uint8_t*>(const_cast<char*>(request.body.data())),
-      request.body.size());
-  const String response = statusCode > 0 ? http.getString() : String();
-  http.end();
+    const int statusCode = http.POST(
+        reinterpret_cast<uint8_t*>(const_cast<char*>(request.body.data())),
+        request.body.size());
+    const String response = statusCode > 0 ? http.getString() : String();
+    http.end();
 
-  tracking::UploadConfirmation confirmation;
-  if (!tracking::validateUploadResponse(
-          statusCode, std::string(response.c_str(), response.length()), batch,
-          confirmation)) {
-    logDiagnostic(
-        "[UPLOAD] HTTPS response rejected status=%d; points remain pending\n",
-        statusCode);
-    vTaskDelete(nullptr);
-    return;
-  }
+    tracking::UploadConfirmation confirmation;
+    if (!tracking::validateUploadResponse(
+            statusCode, std::string(response.c_str(), response.length()), batch,
+            confirmation)) {
+      logDiagnostic("[UPLOAD] HTTPS response rejected status=%d; retrying\n",
+                    statusCode);
+      vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_MS));
+      continue;
+    }
 
-  const uint32_t lastPoint = batch.firstPointNumber +
-      static_cast<uint32_t>(batch.ndjsonPoints.size()) - 1;
-  if (storage.confirmDeliveryThrough(batch.trackingSessionNumber, lastPoint)) {
-    logDiagnostic("[UPLOAD] Confirmed session=%lu points=%lu-%lu\n",
-                  static_cast<unsigned long>(batch.trackingSessionNumber),
-                  static_cast<unsigned long>(batch.firstPointNumber),
-                  static_cast<unsigned long>(lastPoint));
-  } else {
-    logDiagnostic(
-        "[UPLOAD] Confirmation persistence failed; points remain pending\n");
+    const uint32_t lastPoint = batch.firstPointNumber +
+        static_cast<uint32_t>(batch.ndjsonPoints.size()) - 1;
+    if (storage.confirmDeliveryThrough(batch.trackingSessionNumber, lastPoint)) {
+      logDiagnostic("[UPLOAD] Confirmed session=%lu points=%lu-%lu\n",
+                    static_cast<unsigned long>(batch.trackingSessionNumber),
+                    static_cast<unsigned long>(batch.firstPointNumber),
+                    static_cast<unsigned long>(lastPoint));
+    } else {
+      logDiagnostic("[UPLOAD] Confirmation persistence failed; retrying\n");
+      vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_MS));
+    }
   }
-  vTaskDelete(nullptr);
 }
 
 }  // namespace
@@ -519,12 +498,25 @@ void setup() {
   sdMutex = xSemaphoreCreateRecursiveMutex();
   const bool sdReady = initializeSd();
   if (sdReady) {
-    if (!storage.recoverPersistedSessions()) {
+    if (!deliveryRecovery.restore(storage)) {
       logDiagnostic("[RECOVERY] SD session scan FAILED\n");
-    } else if (xTaskCreatePinnedToCore(uploadOneBatch, "track-upload", 8192,
-                                      nullptr, 0, nullptr, 0) !=
-               pdPASS) {
-      logDiagnostic("[UPLOAD] Background task start failed\n");
+    } else {
+      const std::vector<tracking::RecoveredTrackingSession>& sessions =
+          deliveryRecovery.sessions();
+      for (std::vector<tracking::RecoveredTrackingSession>::const_iterator it =
+               sessions.begin();
+           it != sessions.end(); ++it) {
+        logDiagnostic(
+            "[RECOVERY] session=%lu recorded=%lu confirmed=%lu status=%s\n",
+            static_cast<unsigned long>(it->trackingSessionNumber),
+            static_cast<unsigned long>(it->highestRecordedPoint),
+            static_cast<unsigned long>(it->highestConfirmedPoint),
+             it->recoveryRequired ? "safe-resend" : "clean");
+      }
+      if (xTaskCreatePinnedToCore(uploadOneBatch, "track-upload", 8192,
+                                  nullptr, 0, nullptr, 0) != pdPASS) {
+        logDiagnostic("[UPLOAD] Background task start failed\n");
+      }
     }
   }
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
