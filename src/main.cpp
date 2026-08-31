@@ -17,6 +17,7 @@
 #include "delivery_recovery.h"
 #include "delivery_scheduler.h"
 #include "diagnostic_log.h"
+#include "raw_point_log.h"
 #include "storage_cleanup.h"
 #include "tracking_workflow.h"
 #include "upload_contract.h"
@@ -84,8 +85,24 @@ class FileDiagnosticLogStorage : public tracking::DiagnosticLogStorage {
   }
 };
 
+class FileRawPointLogStorage : public tracking::RawPointLogStorage {
+ public:
+  size_t append(const char* bytes, size_t length) override {
+    if (!rawPointFile) return 0;
+    return rawPointFile.write(
+        reinterpret_cast<const uint8_t*>(bytes), length);
+  }
+
+  void flush() override {
+    if (rawPointFile) rawPointFile.flush();
+  }
+
+  void abandon() override { rawPointFile.close(); }
+};
+
 tracking::DiagnosticLog diagnosticLog;
 FileDiagnosticLogStorage diagnosticLogStorage;
+FileRawPointLogStorage rawPointLogStorage;
 
 void logDiagnostic(const char* format, ...) {
   char buffer[256];
@@ -363,10 +380,7 @@ class Esp32TrackingStorage : public tracking::TrackingStorage,
     ScopedSdLock lock;
     if (!lock) return false;
     if (!rawPointFile) return false;
-    const size_t bodyWritten = rawPointFile.print(ndjson.c_str());
-    const size_t newlineWritten = rawPointFile.print('\n');
-    rawPointFile.flush();
-    return bodyWritten == ndjson.size() && newlineWritten == 1 &&
+    return tracking::appendCompleteRawPoint(rawPointLogStorage, ndjson) &&
            deliveryRecovery.recordPoint(point.trackingSessionNumber);
   }
 

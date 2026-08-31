@@ -179,6 +179,21 @@ void reboot_scan_restores_paths_identity_pending_data_and_progress() {
                            storage.requestedPaths[1].c_str());
 }
 
+void reboot_ignores_unterminated_point_tail_and_keeps_complete_lines_pending() {
+  FakeRecoveryStorage storage;
+  storage.addSession(42, 2, tracking::RecoveryReadStatus::missing);
+  storage.files["/session-0000000042/track-points.ndjson"].contents +=
+      "{\"point_number\":";
+
+  tracking::DeliveryRecovery recovery;
+  TEST_ASSERT_TRUE(recovery.restore(storage));
+  TEST_ASSERT_EQUAL_UINT32(2, recovery.sessions()[0].highestRecordedPoint);
+  TEST_ASSERT_EQUAL_UINT32(
+      42, recovery.oldestPendingSession()->trackingSessionNumber);
+  TEST_ASSERT_EQUAL_UINT32(0,
+                           recovery.sessions()[0].highestConfirmedPoint);
+}
+
 void next_session_number_reconciles_persisted_and_scanned_identity() {
   uint32_t next = 0;
   TEST_ASSERT_TRUE(tracking::nextTrackingSessionNumber(40, 105, next));
@@ -293,6 +308,8 @@ int main(int, char**) {
   RUN_TEST(older_progress_triggers_safe_resend_and_sessions_recover_oldest_first);
   RUN_TEST(recorded_points_without_delivery_state_are_pending_with_a_recovery_reason);
   RUN_TEST(reboot_scan_restores_paths_identity_pending_data_and_progress);
+  RUN_TEST(
+      reboot_ignores_unterminated_point_tail_and_keeps_complete_lines_pending);
   RUN_TEST(next_session_number_reconciles_persisted_and_scanned_identity);
   RUN_TEST(unreadable_raw_points_fail_scan_instead_of_looking_empty);
   RUN_TEST(unreadable_or_blank_delivery_state_resends_safely);

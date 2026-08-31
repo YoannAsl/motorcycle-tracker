@@ -82,7 +82,7 @@ The third consecutive qualifying fix starts a tracking session and becomes track
 
 After a tracking session starts, every fresh, valid location becomes a raw track point. Stopped points, weak fixes, and missing optional measurements remain in that raw record; stale or invalid locations do not. The CSV and GPX exports keep their movement filter and receive a point only when its speed is valid and greater than 2 km/h.
 
-Each accepted raw track point is appended to NDJSON and flushed before the workflow treats it as recorded. Each CSV write is also flushed. GPX writes restore the closing XML after every point so the file remains parseable if ignition power disappears without warning. A monotonic tracking session number is kept in ESP32 Preferences, while point numbers restart at 1 for each tracking session.
+Each accepted raw track point is appended to NDJSON and flushed before the workflow treats it as recorded. If the body or its terminating newline is short, the firmware closes that file and stops recording to it. It never adds a newline after a short body. On the next boot, recovery ignores the unterminated tail and delivers the earlier complete lines. Each CSV write is also flushed. GPX writes restore the closing XML after every point so the file remains parseable if ignition power disappears without warning. A monotonic tracking session number is kept in ESP32 Preferences, while point numbers restart at 1 for each tracking session.
 
 ## SD card record
 
@@ -121,7 +121,7 @@ Completed diagnostic logs are delivered on a later boot to the same HTTPS servic
 
 ## Retry and restart recovery
 
-Wi-Fi failure, DNS or connection failure, TLS failure, timeout, authentication rejection, other non-2xx status, malformed JSON, mismatched identity, an incomplete confirmation, or failure to persist a confirmation leaves the affected data pending. Point batches and diagnostic logs keep separate failure counts. Each failure advances that data type through delays of 15, 30, 60, and 120 seconds, then 300 seconds for every later failure; when both types fail in one pass, the background task waits for the shorter delay before checking pending data again. A confirmed and locally persisted success resets that data type's failure count.
+Wi-Fi failure, a combined DNS-or-connection failure, TLS setup or certificate failure, timeout, authentication rejection, another 4xx or 5xx HTTP rejection, another transport failure, malformed JSON, mismatched identity, an incomplete confirmation, or failure to persist a confirmation leaves the affected data pending. Diagnostics report those categories, but do not distinguish DNS failure from connection failure. Point batches and diagnostic logs keep separate failure counts. Each failure advances that data type through delays of 15, 30, 60, and 120 seconds, then 300 seconds for every later failure; when both types fail in one pass, the background task waits for the shorter delay before checking pending data again. A confirmed and locally persisted success resets that data type's failure count.
 
 On every boot, the firmware scans tracking-session directories in number order. Complete NDJSON lines determine the highest recorded point; a trailing partial line is not counted. The last valid, checksummed delivery-progress record determines the highest confirmed point. Missing, damaged, mismatched, or impossible progress is ignored, so the firmware resends from the last safe point. It never infers delivery from an attempted request.
 
@@ -159,9 +159,9 @@ Use the 115200-baud serial monitor and the current tracking session's `session.l
 
 - No `[SD] Mount OK`: check FAT32/MBR formatting, 3.3 V power, common ground, CS GPIO5, and SPI pins 18/19/23.
 - No fresh fixes or no tracking session: place the GPS antenna outdoors, check its TX connection to GPIO16 and 9600-baud output, then verify valid UTC, speed above 2 km/h, and HDOP no higher than 5 for three consecutive checks. A cold fix can take several minutes.
-- `[SD] Raw point ... append/flush FAILED`: stop relying on that card until its wiring, write protection, filesystem, free space, and health have been checked. A failed append is not treated as a recorded track point.
+- `[SD] Raw point ... append/flush FAILED`: stop relying on that card until its wiring, write protection, filesystem, free space, and health have been checked. A short body is left without a newline, the file is closed, and the failed append is not treated as a recorded track point. Recovery ignores that unterminated tail after reboot.
 - Wi-Fi connection failures: verify hotspot name/password, that the phone hotspot is enabled, and that the ESP32 is in range. Local recording should continue and the data should remain pending.
-- Authentication, server, TLS, timeout, or malformed/mismatched confirmation results: check the token, URL path, root CA, service availability, and response contract. Do not bypass certificate validation.
+- DNS-or-connection, authentication, HTTP, TLS, transport, timeout, or malformed/mismatched confirmation results: check the hotspot's internet and DNS service, token, URL path, root CA, service availability, and response contract. Do not bypass certificate validation.
 - `[RECOVERY] ... safe-resend`: delivery progress was absent or damaged; leave the local files intact and allow the stable range to be retried.
 - Cleanup cannot reach below 70%: one or more tracking sessions still contain pending data. Restore delivery rather than manually deleting those directories.
 
@@ -172,8 +172,8 @@ Run this short release check with the target ESP32, NEO-7M, microSD module, FAT3
 - [ ] Cold-boot with the hotspot unavailable. Confirm SD mount and GPS UART messages, and confirm stationary fixes create no tracking session.
 - [ ] Move with three consecutive qualifying fixes. Confirm the third fix creates a new tracking-session directory as track point 1.
 - [ ] Confirm raw NDJSON is written and flushed, and moving points appear in valid CSV and GPX files. Then stop or degrade fix quality and confirm fresh locations remain raw track points while the filtered exports skip stopped points.
-- [ ] Enable the hotspot and record at least 30 track points. Confirm one ordered 30-point HTTPS batch, the expected authentication and metadata, a matching success response, and persisted delivered progress without interruption to recording.
-- [ ] Disable the hotspot during recording. Confirm failures are distinguishable in diagnostics, retries follow the documented delays, local recording continues, and the affected data remains pending.
+- [ ] With the hotspot disabled, create two tracking sessions by recording points, cutting power, and rebooting between them. Give the older tracking session more than 30 points. Enable the hotspot and confirm its lowest pending 30-point range is sent before any range from the newer tracking session. Confirm the expected authentication and metadata, a matching success response, and persisted delivered progress without interruption to recording.
+- [ ] Disable the hotspot during recording. Then induce representative DNS-or-connection, TLS, timeout, authentication, other HTTP, transport, and malformed or mismatched confirmation failures with the test service. Confirm diagnostics use the documented categories, retries follow the documented delays, local recording continues while the raw file remains writable, and the affected data remains pending.
 - [ ] Cut ignition power with a final batch shorter than 30 points, restore power, and confirm no false tracking session is created while stationary. Confirm restart recovery sends the older final partial batch and the completed diagnostic log.
 - [ ] Make the service handle the same stable batch twice. Confirm the repeated request succeeds without duplicate track points and local delivery progress does not move incorrectly.
 - [ ] Exercise cleanup with test data at or above 80% card use. Confirm only the oldest fully delivered, inactive tracking-session directories are removed, cleanup stops below 70%, and pending data is never deleted.
