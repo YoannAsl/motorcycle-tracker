@@ -1,5 +1,6 @@
 use crate::tracking::track_point_identity;
 use serde::Deserialize;
+use std::io::{self, Write};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveredTrackingSession {
@@ -498,6 +499,29 @@ pub enum DiagnosticWriteStatus {
 
 pub trait DiagnosticLogStorage {
     fn append_diagnostic_bytes(&mut self, bytes: &[u8]) -> usize;
+}
+
+pub fn write_synced_bytes<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    sync: impl FnOnce(&mut W) -> io::Result<()>,
+) -> usize
+where
+    W: Write,
+{
+    let mut written = 0;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => written += count,
+        }
+    }
+    if sync(writer).is_ok() {
+        written
+    } else {
+        // ponytail: retry may duplicate unsynced bytes; track offsets if exact log replay is needed.
+        0
+    }
 }
 
 pub struct DiagnosticLog {

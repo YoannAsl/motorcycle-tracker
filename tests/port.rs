@@ -1,5 +1,6 @@
 use motorcycle_tracker::{delivery::*, tracking::*};
 use serde_json::Value;
+use std::io::{self, Write};
 
 #[derive(Default)]
 struct TrackStore {
@@ -451,6 +452,67 @@ fn diagnostics_survive_a_write_split_inside_utf8() {
     );
     assert_eq!(writer.0, [0xc3]);
     assert_eq!(log.pending(), [0xa9]);
+}
+
+#[test]
+fn diagnostics_retain_only_the_suffix_after_a_synced_short_write() {
+    struct Writer {
+        writes_left: usize,
+        sync_ok: bool,
+        bytes: Vec<u8>,
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.writes_left == 0 {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "retry"));
+            }
+            self.writes_left -= 1;
+            let written = bytes.len().min(3);
+            self.bytes.extend_from_slice(&bytes[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DiagnosticLogStorage for Writer {
+        fn append_diagnostic_bytes(&mut self, bytes: &[u8]) -> usize {
+            write_synced_bytes(self, bytes, |writer| {
+                writer
+                    .sync_ok
+                    .then_some(())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "sync"))
+            })
+        }
+    }
+
+    let mut log = DiagnosticLog::new(64);
+    let mut writer = Writer {
+        writes_left: 1,
+        sync_ok: true,
+        bytes: Vec::new(),
+    };
+    assert_eq!(
+        log.append(Some(&mut writer), "abcdef"),
+        DiagnosticWriteStatus::Retained
+    );
+    assert_eq!(writer.bytes, b"abc");
+    writer.writes_left = usize::MAX;
+    assert_eq!(log.flush(&mut writer), DiagnosticWriteStatus::Persisted);
+    assert_eq!(writer.bytes, b"abcdef");
+
+    writer.writes_left = 1;
+    writer.sync_ok = false;
+    assert_eq!(
+        log.append(Some(&mut writer), "ghij"),
+        DiagnosticWriteStatus::Retained
+    );
+    assert_eq!(log.pending(), b"ghij");
+    writer.writes_left = usize::MAX;
+    writer.sync_ok = true;
+    assert_eq!(log.flush(&mut writer), DiagnosticWriteStatus::Persisted);
 }
 
 #[test]

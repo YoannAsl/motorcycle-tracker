@@ -90,6 +90,7 @@ mod firmware {
         csv: Option<File>,
         gpx: Option<File>,
         log: Option<File>,
+        log_path: Option<PathBuf>,
         pending_log: DiagnosticLog,
         stored_logs: Vec<StoredDiagnosticLog>,
         pending_cleanup_log: Vec<u8>,
@@ -103,6 +104,7 @@ mod firmware {
                 csv: None,
                 gpx: None,
                 log: None,
+                log_path: None,
                 pending_log: DiagnosticLog::default(),
                 stored_logs: Vec::new(),
                 pending_cleanup_log: Vec::new(),
@@ -140,7 +142,7 @@ mod firmware {
         fn diagnostic(&mut self, text: &str) {
             info!("{}", text.trim_end());
             let mut pending = std::mem::take(&mut self.pending_log);
-            let status = if self.log.is_some() {
+            let status = if self.log_path.is_some() {
                 pending.append(Some(self), text)
             } else {
                 pending.append(None::<&mut Storage>, text)
@@ -247,13 +249,17 @@ mod firmware {
 
     impl DiagnosticLogStorage for Storage {
         fn append_diagnostic_bytes(&mut self, bytes: &[u8]) -> usize {
-            let Some(file) = &mut self.log else { return 0 };
-            if file.write_all(bytes).and_then(|_| file.sync_data()).is_ok() {
-                bytes.len()
-            } else {
-                self.log = None;
-                0
+            if self.log.is_none() {
+                self.log = self.log_path.as_ref().and_then(append);
             }
+            let Some(file) = &mut self.log else { return 0 };
+            let written = motorcycle_tracker::delivery::write_synced_bytes(file, bytes, |file| {
+                file.sync_data()
+            });
+            if written < bytes.len() {
+                self.log = None;
+            }
+            written
         }
     }
 
@@ -375,7 +381,8 @@ mod firmware {
             self.raw = append(dir.join("track-points.ndjson"));
             self.csv = append(dir.join("gpslog.csv"));
             self.gpx = open_gpx(dir.join("gpslog.gpx"));
-            self.log = append(dir.join("session.log"));
+            let log_path = dir.join("session.log");
+            self.log = append(&log_path);
             if self.raw.is_none() || self.csv.is_none() || self.gpx.is_none() || self.log.is_none()
             {
                 return None;
@@ -391,6 +398,7 @@ mod firmware {
             if !self.recovery.begin_session(n) {
                 return None;
             }
+            self.log_path = Some(log_path);
             let mut pending = std::mem::take(&mut self.pending_log);
             let _ = pending.flush(self);
             self.pending_log = pending;
@@ -712,7 +720,8 @@ mod firmware {
             )?,
             &SdCardConfiguration::new(),
         )?;
-        let _fat = MountedFatfs::mount(Fatfs::new_sdcard(0, card)?, ROOT, 4).context("mount SD")?;
+        // Four session files stay open; uploads and confirmations need one transient descriptor.
+        let _fat = MountedFatfs::mount(Fatfs::new_sdcard(0, card)?, ROOT, 5).context("mount SD")?;
         let part = EspDefaultNvsPartition::take()?;
         let mut s = Storage::new(EspNvs::new(part.clone(), "tracker", true)?);
         let recovered = s.restore();
