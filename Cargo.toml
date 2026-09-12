@@ -1,0 +1,33 @@
+[package]
+name = "motorcycle-tracker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "motorcycle-tracker"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+anyhow = "1"
+embedded-svc = "0.29"
+esp-idf-svc = "0.52.1"
+log = "0.4"
+nmea = "0.7"
+chrono = { version = "0.4", default-features = false }
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
